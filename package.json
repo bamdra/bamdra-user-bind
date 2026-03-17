@@ -1,0 +1,59 @@
+{
+  "name": "@bamdra/bamdra-user-bind",
+  "version": "0.1.0",
+  "description": "Identity resolution, user profile binding, and admin-safe profile tools for OpenClaw channels.",
+  "license": "MIT",
+  "homepage": "https://www.bamdra.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bamdra/bamdra-user-bind.git"
+  },
+  "bugs": {
+    "url": "https://github.com/bamdra/bamdra-user-bind/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "identity",
+    "user-profile",
+    "feishu",
+    "memory"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "bundle": "node ../bamdra-openclaw-memory/scripts/run-local-bin.mjs tsup && node -e \"const fs=require('node:fs');const path='./dist/index.js';const text=fs.readFileSync(path,'utf8').replace(/require\\\\(\\\"sqlite\\\"\\\\)/g,'require(\\\"node:sqlite\\\")');fs.writeFileSync(path,text);\"",
+    "prepublishOnly": "pnpm run bundle"
+  },
+  "openclaw": {
+    "id": "bamdra-user-bind",
+    "type": "tool",
+    "manifest": "./openclaw.plugin.json",
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^24.5.2"
+  }
+}
