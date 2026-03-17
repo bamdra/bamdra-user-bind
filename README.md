@@ -1,56 +1,68 @@
 # bamdra-user-bind
 
-`bamdra-user-bind` is the identity and profile binding plugin for the Bamdra OpenClaw memory suite.
+The identity and living profile layer for the Bamdra suite.
 
-It resolves channel-facing sender identifiers into a stable user boundary, stores user profile data locally, supports Feishu-oriented identity resolution, and exposes admin-safe tooling for querying and editing profile records.
+It can run independently, and it is also auto-provisioned by `bamdra-openclaw-memory`.
 
-## What It Does
+[中文文档](./README.zh-CN.md)
 
-- resolves `channel + sender.id` into a stable `userId`
-- stores bindings and profiles in a local SQLite store
-- exports human-readable backup files for inspection and recovery
-- injects resolved identity into runtime context for downstream memory plugins
-- blocks normal agents from reading other users' private data
-- exposes separate admin tools for natural-language query, edit, merge, issue review, and resync workflows
+## What it does
 
-## Open Source Contents
+`bamdra-user-bind` turns raw channel sender IDs into a stable user boundary.
 
-This repository already contains the actual plugin source code for the current open-source version.
+It also becomes the user's evolving profile layer, including:
 
-- source entrypoint:
-  [src/index.ts](/Users/wood/workspace/macmini-openclaw/openclaw-enhanced/bamdra-user-bind/src/index.ts)
-- plugin manifest:
-  [openclaw.plugin.json](/Users/wood/workspace/macmini-openclaw/openclaw-enhanced/bamdra-user-bind/openclaw.plugin.json)
-- package metadata:
-  [package.json](/Users/wood/workspace/macmini-openclaw/openclaw-enhanced/bamdra-user-bind/package.json)
+- preferred address
+- timezone
+- tone preferences
+- role
+- long-lived user notes
 
-The file count is intentionally small because this first public version is shipped as a compact plugin rather than a multi-package codebase.
+## Why it matters
 
-## Current Storage Model
+Without an identity layer:
 
-- runtime primary store:
+- the same person can fragment across channels or sessions
+- memory can attach to the wrong boundary
+- personalization becomes fragile
+
+With it:
+
+- user-aware memory becomes stable
+- personalization survives new sessions
+- the assistant can gradually adapt to the user's style and working habits
+
+## Storage model
+
+- primary store:
   `~/.openclaw/data/bamdra-user-bind/profiles.sqlite`
+- editable Markdown mirrors:
+  `~/.openclaw/data/bamdra-user-bind/profiles/private/{userId}.md`
 - export directory:
   `~/.openclaw/data/bamdra-user-bind/exports/`
 
-The runtime only queries the SQLite store. Export files exist for backup and manual inspection.
+The SQLite store is the controlled source of truth.
 
-## Security Boundary
+The Markdown mirror is for humans, so profiles stay editable like a living per-user guide instead of becoming a hidden black box.
 
-- normal agents can only read the current resolved user
-- cross-user reads are denied by implementation, not by prompt wording alone
-- admin actions are separated into dedicated tools
-- audit records are written for admin reads, edits, merges, syncs, and rejected access attempts
+## Best practice
 
-## Relationship To Other Repositories
+- keep SQLite local
+- keep profile mirrors private
+- let humans edit the mirror gradually
+- use admin tools only for audit, merge, repair, and maintenance
 
-- required by:
-  `bamdra-openclaw-memory`
-- optional companion:
-  `bamdra-memory-vector`
+## What it unlocks
 
-## Build
+With `bamdra-openclaw-memory`:
 
-```bash
-pnpm run bundle
-```
+- memory becomes user-aware instead of session-only
+
+With `bamdra-memory-vector`:
+
+- private notes stay private while still influencing local recall
+
+## Repository
+
+- [GitHub organization](https://github.com/bamdra)
+- [Repository](https://github.com/bamdra/bamdra-user-bind)

@@ -1,0 +1,43 @@
+---
+name: bamdra-user-bind-admin
+description: Use the admin-safe natural-language tools to inspect, fix, merge, and sync user bindings and profiles.
+---
+
+# Bamdra User Bind Admin
+
+Use this skill only on an authorized admin agent.
+
+Its purpose is operational: inspect user bindings, repair incorrect profile fields, merge duplicate users, and check sync issues without exposing unrestricted bulk access.
+
+## Allowed Jobs
+
+- query a specific user profile or binding by `userId`
+- correct nickname, role, timezone, preferences, or personality fields
+- merge duplicate user records
+- inspect sync failures and identity resolution issues
+- request a resync for a known user
+
+## Tooling
+
+Use the admin tools in natural language:
+
+- `user_bind_admin_query`
+- `user_bind_admin_edit`
+- `user_bind_admin_merge`
+- `user_bind_admin_list_issues`
+- `user_bind_admin_sync`
+
+## Good Requests
+
+- “查询 user:u_123 的画像和绑定关系”
+- “把 user:u_123 的称呼改成老板，时区改成 Asia/Shanghai”
+- “合并 user:u_old 到 user:u_new”
+- “列出最近的绑定失败问题”
+
+## Safety Rules
+
+- do not perform blind bulk edits
+- prefer specific target users over fuzzy descriptions
+- if a request is ambiguous, narrow it before making changes
+- remember that every admin action is auditable
+- do not expose unrelated users when answering a narrow admin query
