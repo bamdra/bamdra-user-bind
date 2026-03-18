@@ -12,6 +12,11 @@ Bamdra 套件中的身份与“活画像”层。
 openclaw plugins install @bamdra/bamdra-user-bind
 ```
 
+发布包下载：
+
+- GitHub Releases: https://github.com/bamdra/bamdra-user-bind/releases
+- 本地也可以执行 `pnpm package:release` 生成独立发布包
+
 [English README](./README.md)
 
 ## 它做什么
@@ -78,3 +83,4 @@ Markdown 镜像则是给人编辑的，让用户画像更像一份活的 per-use
 
 - [GitHub 首页](https://github.com/bamdra)
 - [仓库地址](https://github.com/bamdra/bamdra-user-bind)
+- [Releases](https://github.com/bamdra/bamdra-user-bind/releases)

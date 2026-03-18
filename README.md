@@ -12,6 +12,11 @@ Install directly:
 openclaw plugins install @bamdra/bamdra-user-bind
 ```
 
+Release package:
+
+- GitHub Releases: https://github.com/bamdra/bamdra-user-bind/releases
+- You can also build a local release bundle with `pnpm package:release`
+
 [中文文档](./README.zh-CN.md)
 
 ## What it does
@@ -78,3 +83,4 @@ With `bamdra-memory-vector`:
 
 - [GitHub organization](https://github.com/bamdra)
 - [Repository](https://github.com/bamdra/bamdra-user-bind)
+- [Releases](https://github.com/bamdra/bamdra-user-bind/releases)

@@ -34,7 +34,8 @@
   },
   "scripts": {
     "bundle": "node ../bamdra-openclaw-memory/scripts/run-local-bin.mjs tsup && node -e \"const fs=require('node:fs');const path='./dist/index.js';const text=fs.readFileSync(path,'utf8').replace(/require\\\\(\\\"sqlite\\\"\\\\)/g,'require(\\\"node:sqlite\\\")');fs.writeFileSync(path,text);\"",
-    "prepublishOnly": "pnpm run bundle"
+    "prepublishOnly": "pnpm run bundle",
+    "package:release": "node ./scripts/package-release.mjs"
   },
   "openclaw": {
     "id": "bamdra-user-bind",
