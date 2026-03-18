@@ -1,8 +1,16 @@
 # bamdra-user-bind
 
+![Bamdra Animated Logo](./docs/assets/bamdra-logo-animated.svg)
+
 The identity and living profile layer for the Bamdra suite.
 
 It can run independently, and it is also auto-provisioned by `bamdra-openclaw-memory`.
+
+Install directly:
+
+```bash
+openclaw plugins install @bamdra/bamdra-user-bind
+```
 
 [中文文档](./README.zh-CN.md)
 
@@ -51,6 +59,10 @@ The Markdown mirror is for humans, so profiles stay editable like a living per-u
 - keep profile mirrors private
 - let humans edit the mirror gradually
 - use admin tools only for audit, merge, repair, and maintenance
+
+## Architecture
+
+![Bamdra Suite Architecture](./docs/assets/architecture-technical-en.svg)
 
 ## What it unlocks
 

@@ -1,8 +1,16 @@
 # bamdra-user-bind
 
+![Bamdra Animated Logo](./docs/assets/bamdra-logo-animated.svg)
+
 Bamdra 套件中的身份与“活画像”层。
 
 它可以独立运行，也会被 `bamdra-openclaw-memory` 自动补齐。
+
+单独安装：
+
+```bash
+openclaw plugins install @bamdra/bamdra-user-bind
+```
 
 [English README](./README.md)
 
@@ -51,6 +59,10 @@ Markdown 镜像则是给人编辑的，让用户画像更像一份活的 per-use
 - 画像镜像保持私有
 - 让人逐步维护画像镜像
 - 管理员能力只用于审计、合并、修复和维护
+
+## 架构图
+
+![Bamdra 套件架构图](./docs/assets/architecture-technical-zh.svg)
 
 ## 它能解锁什么
 
