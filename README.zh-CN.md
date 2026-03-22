@@ -31,6 +31,13 @@ openclaw plugins install @bamdra/bamdra-user-bind
 - 角色
 - 长期用户备注
 
+这轮又补了几件关键的事：
+
+- 用户画像主键现在带 channel 作用域，像 Feishu、Telegram、WhatsApp、Discord、Google Chat、Slack、Mattermost、Signal、iMessage、Microsoft Teams 这些渠道的归属会更清楚
+- 当稳定绑定暂时拿不到时，运行时可以先落一份 provisional 画像，后续补到真实绑定后再自动归并
+- 画像更新现在支持语义上的 `replace / append / remove`，不再只有整段覆盖
+- Markdown 镜像继续保留 frontmatter 作为机器主源，并把正文里的“已确认画像”变成同步的人类可读镜像
+
 ## 画像策略
 
 - `userId` 是画像的主键
@@ -65,6 +72,30 @@ openclaw plugins install @bamdra/bamdra-user-bind
 SQLite 是受控主源。
 
 Markdown 镜像则是给人编辑的，让用户画像更像一份活的 per-user 指南，而不是一个无法触达的黑盒。
+
+## 画像更新语义
+
+不是所有长期偏好变化都应该直接覆盖旧字段。
+
+`bamdra-user-bind` 现在会区分：
+
+- `replace`：用户是在纠正或替换旧偏好
+- `append`：用户是在追加一个新的长期偏好，并没有撤销旧偏好
+- `remove`：用户明确希望移除某一个旧特征
+
+这对 `preferences`、`personality`、`notes` 这类字段尤其重要，因为它们很多时候更适合增量维护。
+
+## 临时身份与后续归并
+
+某些渠道或某些 App 状态下，第一轮对话不一定立刻能解析出稳定绑定。
+
+这时运行时会：
+
+- 先把用户刚表达出来的稳定偏好写进 provisional 画像，避免信息丢失
+- 在后台继续主动补绑定
+- 一旦补到真实绑定，就把 provisional 画像自动归并到正式画像
+
+这样即使当前身份链路暂时不完整，也不会让用户刚说的偏好白白丢掉。
 
 ## 最佳实践
 

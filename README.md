@@ -31,6 +31,13 @@ It also becomes the user's evolving profile layer, including:
 - role
 - long-lived user notes
 
+Recent behavior improvements:
+
+- channel-scoped user IDs now make profile ownership explicit across Feishu, Telegram, WhatsApp, Discord, Google Chat, Slack, Mattermost, Signal, iMessage, and Microsoft Teams
+- when a stable binding is temporarily unavailable, the runtime can persist a provisional profile first and merge it into the stable profile later
+- profile updates now support semantic `replace`, `append`, and `remove` instead of only blind overwrite
+- the Markdown mirror now keeps frontmatter as the machine-readable source and renders a synchronized `Confirmed Profile` section for humans
+
 ## Profile Policy
 
 - `userId` is the primary key for personalization
@@ -65,6 +72,30 @@ With it:
 The SQLite store is the controlled source of truth.
 
 The Markdown mirror is for humans, so profiles stay editable like a living per-user guide instead of becoming a hidden black box.
+
+## Profile update semantics
+
+Not every durable user preference should overwrite the entire old field.
+
+`bamdra-user-bind` now distinguishes between:
+
+- `replace`: the user is correcting or changing an earlier durable preference
+- `append`: the user is adding another durable preference without revoking the old one
+- `remove`: the user explicitly wants one older durable trait removed
+
+This is especially useful for fields like `preferences`, `personality`, and `notes`, where the right behavior is often incremental.
+
+## Provisional identity and later merge
+
+Some channels or app states can temporarily fail to resolve a stable bound identity on the first turn.
+
+In those cases, the runtime can:
+
+- persist a provisional profile immediately so the user's newly stated preferences are not lost
+- keep trying to repair the binding in the background
+- merge the provisional profile into the stable user profile once the real binding is available
+
+This keeps the user experience responsive without turning missing identity resolution into data loss.
 
 ## Best practice
 

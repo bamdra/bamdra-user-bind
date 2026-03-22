@@ -30,7 +30,7 @@ Use the admin tools in natural language:
 ## Good Requests
 
 - “查询 user:u_123 的画像和绑定关系”
-- “把 user:u_123 的称呼改成老板，时区改成 Asia/Shanghai”
+- “把 user:u_123 的称呼改成老板，时区改成 Europe/Berlin”
 - “把 user:u_123 的默认称呼改成丰哥”
 - “合并 user:u_old 到 user:u_new”
 - “列出最近的绑定失败问题”
@@ -42,3 +42,5 @@ Use the admin tools in natural language:
 - if a request is ambiguous, narrow it before making changes
 - remember that every admin action is auditable
 - do not expose unrelated users when answering a narrow admin query
+- do not use admin tools as a shortcut for answering the current user's own profile or address preference
+- if the issue is that the current session cannot resolve the user, repair the binding first, then let the normal self-profile flow continue
