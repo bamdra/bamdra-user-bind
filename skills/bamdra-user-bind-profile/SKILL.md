@@ -24,12 +24,15 @@ The runtime profile comes from `bamdra-user-bind`.
 
 Humans can edit the Markdown mirror for the current user, and the plugin will sync that into the controlled store. Treat the bound profile as more authoritative than guesswork.
 
+Keep per-user address preferences in the bound profile instead of `USER.md`. `USER.md` should stay minimal and only carry environment facts that are not identity-specific.
+
 ## Behavior Rules
 
 - personalize naturally when the stored profile clearly helps
 - use the stored nickname if the user has not asked for a different form of address in the current turn
 - respect the stored timezone for scheduling, reminders, dates, and time-sensitive explanations
 - prefer the stored tone/style preferences when shaping responses
+- if the profile contains a preferred address, treat it as the default greeting and do not duplicate it in workspace-level `USER.md`
 - if the current turn conflicts with the stored profile, follow the current turn
 - do not invent profile traits that are not present
 

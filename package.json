@@ -1,6 +1,6 @@
 {
   "name": "@bamdra/bamdra-user-bind",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "description": "Identity resolution, user profile binding, and admin-safe profile tools for OpenClaw channels.",
   "license": "MIT",
   "homepage": "https://www.bamdra.com",

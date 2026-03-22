@@ -25,11 +25,19 @@ Release package:
 
 It also becomes the user's evolving profile layer, including:
 
-- preferred address
+- `userId`-scoped preferred address
 - timezone
 - tone preferences
 - role
 - long-lived user notes
+
+## Profile Policy
+
+- `userId` is the primary key for personalization
+- preferred address should live in the bound profile, not in scattered workspace `USER.md` files
+- workspace `USER.md` should stay minimal and only keep environment facts
+- if the current turn explicitly asks for a different address, follow the current turn
+- admin tools are for repair, merge, audit, and sync, not for blind bulk rewriting
 
 ## Why it matters
 
@@ -64,6 +72,7 @@ The Markdown mirror is for humans, so profiles stay editable like a living per-u
 - keep profile mirrors private
 - let humans edit the mirror gradually
 - use admin tools only for audit, merge, repair, and maintenance
+- when updating how someone is addressed, update the bound profile for that `userId` first
 
 ## Architecture
 

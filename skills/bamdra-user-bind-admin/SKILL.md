@@ -12,7 +12,7 @@ Its purpose is operational: inspect user bindings, repair incorrect profile fiel
 ## Allowed Jobs
 
 - query a specific user profile or binding by `userId`
-- correct nickname, role, timezone, preferences, or personality fields
+- correct nickname, role, timezone, preferences, personality fields, or preferred address
 - merge duplicate user records
 - inspect sync failures and identity resolution issues
 - request a resync for a known user
@@ -31,6 +31,7 @@ Use the admin tools in natural language:
 
 - “查询 user:u_123 的画像和绑定关系”
 - “把 user:u_123 的称呼改成老板，时区改成 Asia/Shanghai”
+- “把 user:u_123 的默认称呼改成丰哥”
 - “合并 user:u_old 到 user:u_new”
 - “列出最近的绑定失败问题”
 
