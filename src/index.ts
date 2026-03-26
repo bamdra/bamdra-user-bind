@@ -7,6 +7,9 @@ import { fileURLToPath } from "node:url";
 
 const PLUGIN_ID = "bamdra-user-bind";
 const GLOBAL_API_KEY = "__OPENCLAW_BAMDRA_USER_BIND__";
+const GLOBAL_RUNTIME_KEY = "__OPENCLAW_BAMDRA_USER_BIND_RUNTIME__";
+const GLOBAL_RUNTIME_BRAND_KEY = "__OPENCLAW_BAMDRA_USER_BIND_RUNTIME_BRAND__";
+const GLOBAL_PENDING_REFINE_KEY = "__OPENCLAW_BAMDRA_USER_BIND_PENDING_REFINE__";
 const PROFILE_SKILL_ID = "bamdra-user-bind-profile";
 const ADMIN_SKILL_ID = "bamdra-user-bind-admin";
 const SELF_TOOL_NAMES = [
@@ -36,6 +39,11 @@ const REQUIRED_FEISHU_IDENTITY_SCOPES = [
   "contact:user.employee_id:readonly",
   "contact:user.base:readonly",
 ] as const;
+const SEMANTIC_PROFILE_CAPTURE_TIMEOUT_MS = readSemanticProfileCaptureTimeoutMs();
+const SEMANTIC_PROFILE_BATCH_WINDOW_MS = 240;
+const SEMANTIC_PROFILE_BATCH_MAX_FRAGMENTS = 4;
+const SEMANTIC_PROFILE_BATCH_MAX_CHARS = 360;
+const SEMANTIC_PROFILE_RETRY_MAX_ATTEMPTS = 3;
 const CHANNELS_WITH_NATIVE_STABLE_IDS = new Set([
   "telegram",
   "whatsapp",
@@ -52,11 +60,15 @@ export interface UserProfile {
   userId: string;
   name: string | null;
   gender: string | null;
+  birthDate: string | null;
+  birthYear: string | null;
+  age: string | null;
   email: string | null;
   avatar: string | null;
   nickname: string | null;
   preferences: string | null;
   personality: string | null;
+  interests: string | null;
   role: string | null;
   timezone: string | null;
   notes: string | null;
@@ -142,12 +154,6 @@ interface FeishuUserResolution {
   profilePatch: Partial<UserProfile>;
 }
 
-interface FeishuScopeStatus {
-  scopes: string[];
-  missingIdentityScopes: string[];
-  hasDocumentAccess: boolean;
-}
-
 interface FeishuAccountCredentials {
   accountId: string;
   appId: string;
@@ -162,12 +168,30 @@ interface OpenAiCompatibleModelConfig {
   apiKey: string;
 }
 
+interface PluginInstallMetadata {
+  source: string;
+  spec: string;
+  installPath: string;
+  version: string;
+  resolvedName: string;
+  resolvedVersion: string;
+  resolvedSpec: string;
+  resolvedAt: string;
+  installedAt: string;
+}
+
 type ProfileFieldOperation = "replace" | "append" | "remove";
 
 interface ProfilePatchOperations {
+  name?: ProfileFieldOperation;
+  gender?: ProfileFieldOperation;
+  birthDate?: ProfileFieldOperation;
+  birthYear?: ProfileFieldOperation;
+  age?: ProfileFieldOperation;
   nickname?: ProfileFieldOperation;
   preferences?: ProfileFieldOperation;
   personality?: ProfileFieldOperation;
+  interests?: ProfileFieldOperation;
   role?: ProfileFieldOperation;
   timezone?: ProfileFieldOperation;
   notes?: ProfileFieldOperation;
@@ -186,6 +210,16 @@ interface PendingBindingResolution {
   reason: string;
   attempts: number;
   nextAttemptAt: number;
+}
+
+interface PendingSemanticCapture {
+  identity: ResolvedIdentity;
+  messages: string[];
+  timer: ReturnType<typeof setTimeout> | null;
+}
+
+interface ResolveIdentityOptions {
+  allowRemoteLookup?: boolean;
 }
 
 function logUserBindEvent(event: string, details: Record<string, unknown> = {}): void {
@@ -214,11 +248,15 @@ class UserBindStore {
         user_id TEXT PRIMARY KEY,
         name TEXT,
         gender TEXT,
+        birth_date TEXT,
+        birth_year TEXT,
+        age TEXT,
         email TEXT,
         avatar TEXT,
         nickname TEXT,
         preferences TEXT,
         personality TEXT,
+        interests TEXT,
         role TEXT,
         timezone TEXT,
         notes TEXT,
@@ -260,6 +298,10 @@ class UserBindStore {
     `);
     this.ensureColumn(TABLES.profiles, "timezone", "TEXT");
     this.ensureColumn(TABLES.profiles, "notes", "TEXT");
+    this.ensureColumn(TABLES.profiles, "birth_date", "TEXT");
+    this.ensureColumn(TABLES.profiles, "birth_year", "TEXT");
+    this.ensureColumn(TABLES.profiles, "age", "TEXT");
+    this.ensureColumn(TABLES.profiles, "interests", "TEXT");
     this.migrateChannelScopedUserIds();
   }
 
@@ -270,6 +312,17 @@ class UserBindStore {
   getProfile(userId: string): UserProfile | null {
     this.syncMarkdownToStore(userId);
     return this.getProfileFromDatabase(userId);
+  }
+
+  listProfilesWithPendingSemanticRefine(limit = 20): UserProfile[] {
+    const rows = this.db.prepare(`
+      SELECT user_id, name, gender, birth_date, birth_year, age, email, avatar, nickname, preferences, personality, interests, role, timezone, notes, visibility, source, updated_at
+      FROM ${TABLES.profiles}
+      WHERE notes LIKE '%[pending-profile-refine:%'
+      ORDER BY updated_at DESC
+      LIMIT ?
+    `).all(limit) as Array<Record<string, unknown>>;
+    return rows.map(mapProfileRow);
   }
 
   findBinding(channelType: string, openId: string | null): { userId: string; source: string } | null {
@@ -357,11 +410,15 @@ class UserBindStore {
       userId: scopedUserId,
       name: args.profilePatch.name ?? current?.name ?? null,
       gender: args.profilePatch.gender ?? current?.gender ?? null,
+      birthDate: args.profilePatch.birthDate ?? current?.birthDate ?? null,
+      birthYear: args.profilePatch.birthYear ?? current?.birthYear ?? null,
+      age: args.profilePatch.age ?? current?.age ?? null,
       email: args.profilePatch.email ?? current?.email ?? null,
       avatar: args.profilePatch.avatar ?? current?.avatar ?? null,
       nickname: args.profilePatch.nickname ?? current?.nickname ?? null,
       preferences: args.profilePatch.preferences ?? current?.preferences ?? null,
       personality: args.profilePatch.personality ?? current?.personality ?? null,
+      interests: args.profilePatch.interests ?? current?.interests ?? null,
       role: args.profilePatch.role ?? current?.role ?? null,
       timezone: args.profilePatch.timezone ?? current?.timezone ?? getServerTimezone(),
       notes: args.profilePatch.notes ?? current?.notes ?? defaultProfileNotes(),
@@ -371,16 +428,20 @@ class UserBindStore {
     };
 
     this.db.prepare(`
-      INSERT INTO ${TABLES.profiles} (user_id, name, gender, email, avatar, nickname, preferences, personality, role, timezone, notes, visibility, source, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO ${TABLES.profiles} (user_id, name, gender, birth_date, birth_year, age, email, avatar, nickname, preferences, personality, interests, role, timezone, notes, visibility, source, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(user_id) DO UPDATE SET
         name = excluded.name,
         gender = excluded.gender,
+        birth_date = excluded.birth_date,
+        birth_year = excluded.birth_year,
+        age = excluded.age,
         email = excluded.email,
         avatar = excluded.avatar,
         nickname = excluded.nickname,
         preferences = excluded.preferences,
         personality = excluded.personality,
+        interests = excluded.interests,
         role = excluded.role,
         timezone = excluded.timezone,
         notes = excluded.notes,
@@ -391,11 +452,15 @@ class UserBindStore {
       next.userId,
       next.name,
       next.gender,
+      next.birthDate,
+      next.birthYear,
+      next.age,
       next.email,
       next.avatar,
       next.nickname,
       next.preferences,
       next.personality,
+      next.interests,
       next.role,
       next.timezone,
       next.notes,
@@ -449,6 +514,27 @@ class UserBindStore {
     });
   }
 
+  replaceProfileNotes(userId: string, notes: string | null, source: string): UserProfile {
+    const current = this.getProfile(userId);
+    if (!current) {
+      throw new Error(`Unknown user ${userId}`);
+    }
+    const next: UserProfile = {
+      ...current,
+      notes,
+      source,
+      updatedAt: new Date().toISOString(),
+    };
+    this.db.prepare(`
+      UPDATE ${TABLES.profiles}
+      SET notes = ?, source = ?, updated_at = ?
+      WHERE user_id = ?
+    `).run(next.notes, next.source, next.updatedAt, current.userId);
+    this.writeProfileMarkdown(next);
+    this.writeExports();
+    return next;
+  }
+
   mergeUsers(fromUserId: string, intoUserId: string): UserProfile {
     const from = this.getProfile(fromUserId);
     const into = this.getProfile(intoUserId);
@@ -463,11 +549,15 @@ class UserBindStore {
       profilePatch: {
         name: into.name ?? from.name,
         gender: into.gender ?? from.gender,
+        birthDate: into.birthDate ?? from.birthDate,
+        birthYear: into.birthYear ?? from.birthYear,
+        age: into.age ?? from.age,
         email: into.email ?? from.email,
         avatar: into.avatar ?? from.avatar,
         nickname: into.nickname ?? from.nickname,
         preferences: into.preferences ?? from.preferences,
         personality: into.personality ?? from.personality,
+        interests: into.interests ?? from.interests,
         role: into.role ?? from.role,
         timezone: into.timezone ?? from.timezone,
         notes: joinNotes(into.notes, from.notes),
@@ -486,7 +576,7 @@ class UserBindStore {
 
   private getProfileFromDatabase(userId: string): UserProfile | null {
     const row = this.db.prepare(`
-      SELECT user_id, name, gender, email, avatar, nickname, preferences, personality, role, timezone, notes, visibility, source, updated_at
+      SELECT user_id, name, gender, birth_date, birth_year, age, email, avatar, nickname, preferences, personality, interests, role, timezone, notes, visibility, source, updated_at
       FROM ${TABLES.profiles} WHERE user_id = ?
     `).get(userId) as Record<string, unknown> | undefined;
     return row ? mapProfileRow(row) : null;
@@ -533,19 +623,29 @@ class UserBindStore {
       const markdownMtime = statSync(markdownPath).mtime.toISOString();
       const markdownHash = computeProfilePayloadHash({
         name: patch.name ?? null,
+        gender: patch.gender ?? null,
+        birthDate: patch.birthDate ?? null,
+        birthYear: patch.birthYear ?? null,
+        age: patch.age ?? null,
         nickname: patch.nickname ?? null,
         timezone: patch.timezone ?? null,
         preferences: patch.preferences ?? null,
         personality: patch.personality ?? null,
+        interests: patch.interests ?? null,
         role: patch.role ?? null,
         visibility: patch.visibility ?? current.visibility,
       }, patch.notes ?? null);
       const currentHash = computeProfilePayloadHash({
         name: current.name,
+        gender: current.gender,
+        birthDate: current.birthDate,
+        birthYear: current.birthYear,
+        age: current.age,
         nickname: current.nickname,
         timezone: current.timezone,
         preferences: current.preferences,
         personality: current.personality,
+        interests: current.interests,
         role: current.role,
         visibility: current.visibility,
       }, current.notes);
@@ -586,7 +686,7 @@ class UserBindStore {
 
   private writeExports(): void {
     const profiles = this.db.prepare(`
-      SELECT user_id, name, gender, email, avatar, nickname, preferences, personality, role, timezone, notes, visibility, source, updated_at
+      SELECT user_id, name, gender, birth_date, birth_year, age, email, avatar, nickname, preferences, personality, interests, role, timezone, notes, visibility, source, updated_at
       FROM ${TABLES.profiles}
       ORDER BY updated_at DESC
     `).all() as Array<Record<string, unknown>>;
@@ -652,16 +752,20 @@ class UserBindStore {
       };
       this.db.prepare(`DELETE FROM ${TABLES.profiles} WHERE user_id = ?`).run(fromUserId);
       this.db.prepare(`
-        INSERT INTO ${TABLES.profiles} (user_id, name, gender, email, avatar, nickname, preferences, personality, role, timezone, notes, visibility, source, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO ${TABLES.profiles} (user_id, name, gender, birth_date, birth_year, age, email, avatar, nickname, preferences, personality, interests, role, timezone, notes, visibility, source, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
           name = excluded.name,
           gender = excluded.gender,
+          birth_date = excluded.birth_date,
+          birth_year = excluded.birth_year,
+          age = excluded.age,
           email = excluded.email,
           avatar = excluded.avatar,
           nickname = excluded.nickname,
           preferences = excluded.preferences,
           personality = excluded.personality,
+          interests = excluded.interests,
           role = excluded.role,
           timezone = excluded.timezone,
           notes = excluded.notes,
@@ -672,11 +776,15 @@ class UserBindStore {
         merged.userId,
         merged.name,
         merged.gender,
+        merged.birthDate,
+        merged.birthYear,
+        merged.age,
         merged.email,
         merged.avatar,
         merged.nickname,
         merged.preferences,
         merged.personality,
+        merged.interests,
         merged.role,
         merged.timezone,
         merged.notes,
@@ -707,13 +815,18 @@ class UserBindRuntime {
   private readonly bindingCache = new Map<string, { expiresAt: number; identity: ResolvedIdentity }>();
   private readonly semanticCaptureCache = new Map<string, number>();
   private readonly semanticCaptureInFlight = new Set<string>();
+  private readonly semanticCaptureRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly semanticCaptureRetryAttempts = new Map<string, number>();
+  private readonly pendingSemanticCaptures = new Map<string, PendingSemanticCapture>();
   private readonly pendingBindingResolutions = new Map<string, PendingBindingResolution>();
-  private readonly feishuScopeStatusCache = new Map<string, FeishuScopeStatus>();
-  private bitableMirror: { appToken: string | null; tableId: string | null } | null = null;
   private readonly feishuTokenCache = new Map<string, { token: string; expiresAt: number }>();
+  private readonly globalPendingSemanticRefines = getGlobalPendingSemanticRefines();
   private pendingBindingTimer: ReturnType<typeof setInterval> | null = null;
   private pendingBindingKickTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingSemanticSweepTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingBindingSweepInFlight = false;
+  private pendingSemanticSweepInFlight = false;
+  private registered = false;
 
   constructor(private readonly host: HookApi, inputConfig: Partial<UserBindConfig> | undefined) {
     this.config = normalizeConfig(inputConfig);
@@ -733,10 +846,29 @@ class UserBindRuntime {
       clearTimeout(this.pendingBindingKickTimer);
       this.pendingBindingKickTimer = null;
     }
+    if (this.pendingSemanticSweepTimer) {
+      clearTimeout(this.pendingSemanticSweepTimer);
+      this.pendingSemanticSweepTimer = null;
+    }
+    for (const pending of this.pendingSemanticCaptures.values()) {
+      if (pending.timer) {
+        clearTimeout(pending.timer);
+      }
+    }
+    this.pendingSemanticCaptures.clear();
+    for (const timer of this.semanticCaptureRetryTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.semanticCaptureRetryTimers.clear();
+    this.semanticCaptureRetryAttempts.clear();
     this.store.close();
   }
 
   register(): void {
+    if (this.registered) {
+      return;
+    }
+    this.registered = true;
     queueMicrotask(() => {
       try {
         bootstrapOpenClawHost(this.config);
@@ -747,6 +879,7 @@ class UserBindRuntime {
     this.registerHooks();
     this.registerTools();
     this.startPendingBindingWorker();
+    this.schedulePendingSemanticSweep();
     exposeGlobalApi(this);
   }
 
@@ -754,7 +887,7 @@ class UserBindRuntime {
     return this.sessionCache.get(sessionId) ?? null;
   }
 
-  async resolveFromContext(context: unknown): Promise<ResolvedIdentity | null> {
+  async resolveFromContext(context: unknown, options: ResolveIdentityOptions = {}): Promise<ResolvedIdentity | null> {
     const parsed = parseIdentityContext(enrichIdentityContext(context));
     if (parsed.sessionId && !parsed.channelType) {
       const cached = this.sessionCache.get(parsed.sessionId) ?? null;
@@ -797,18 +930,22 @@ class UserBindRuntime {
     let remoteProfilePatch: Partial<UserProfile> = {};
     if (parsed.channelType === "feishu" && parsed.openId) {
       if (!userId) {
-        const remote = await this.tryResolveFeishuUser(parsed.openId);
-        if (remote?.userId) {
-          userId = remote.userId;
-          source = remote.source;
-          remoteProfilePatch = remote.profilePatch;
-        } else if (remote?.source === "feishu-contact-scope-missing") {
-          source = remote.source;
-          remoteProfilePatch = remote.profilePatch;
-          this.enqueuePendingBindingResolution(parsed.channelType, parsed.openId, remote.source);
+        if (options.allowRemoteLookup) {
+          const remote = await this.tryResolveFeishuUser(parsed.openId);
+          if (remote?.userId) {
+            userId = remote.userId;
+            source = remote.source;
+            remoteProfilePatch = remote.profilePatch;
+          } else if (remote?.source === "feishu-contact-scope-missing") {
+            source = remote.source;
+            remoteProfilePatch = remote.profilePatch;
+            this.enqueuePendingBindingResolution(parsed.channelType, parsed.openId, remote.source);
+          } else {
+            this.store.recordIssue("feishu-resolution", `Failed to resolve real user id for ${parsed.openId}`);
+            this.enqueuePendingBindingResolution(parsed.channelType, parsed.openId, "feishu-resolution-miss");
+          }
         } else {
-          this.store.recordIssue("feishu-resolution", `Failed to resolve real user id for ${parsed.openId}`);
-          this.enqueuePendingBindingResolution(parsed.channelType, parsed.openId, "feishu-resolution-miss");
+          this.enqueuePendingBindingResolution(parsed.channelType, parsed.openId, "feishu-deferred-resolution");
         }
       }
     }
@@ -885,9 +1022,6 @@ class UserBindRuntime {
       expiresAt: Date.now() + this.config.cacheTtlMs,
       identity,
     });
-    if (shouldPersistIdentity && parsed.channelType === "feishu") {
-      await this.syncFeishuMirror(identity);
-    }
     return identity;
   }
 
@@ -1056,7 +1190,7 @@ class UserBindRuntime {
       sessionId: identity.sessionId,
       sender: { id: identity.senderOpenId, name: identity.senderName },
       channel: { type: identity.channelType },
-    });
+    }, { allowRemoteLookup: true });
     if (!refreshed) {
       throw new Error("Unable to refresh binding for current session");
     }
@@ -1064,15 +1198,74 @@ class UserBindRuntime {
   }
 
   private async captureProfileFromMessage(context: unknown, identity: ResolvedIdentity): Promise<void> {
-    const messageText = extractUserUtterance(context);
-    if (!messageText) {
+    const utteranceText = extractUserUtterance(context);
+    if (!utteranceText) {
       logUserBindEvent("semantic-profile-capture-skipped-no-utterance", {
         userId: identity.userId,
         sessionId: identity.sessionId,
       });
       return;
     }
-    const fingerprint = hashId(`${identity.sessionId}:${messageText}`);
+    const messageText = buildSemanticCaptureInput(context, utteranceText);
+    if (!messageText) {
+      return;
+    }
+    if (shouldIgnoreSemanticProfileCaptureCandidate(utteranceText) && messageText === utteranceText) {
+      logUserBindEvent("semantic-profile-capture-skipped-trivial-utterance", {
+        userId: identity.userId,
+        sessionId: identity.sessionId,
+        messagePreview: utteranceText.slice(0, 120),
+      });
+      return;
+    }
+    this.enqueueSemanticProfileCapture(identity, messageText);
+  }
+
+  private enqueueSemanticProfileCapture(identity: ResolvedIdentity, messageText: string): void {
+    const sessionId = identity.sessionId;
+    const pending = this.pendingSemanticCaptures.get(sessionId) ?? {
+      identity,
+      messages: [],
+      timer: null,
+    };
+    pending.identity = identity;
+    pending.messages = appendSemanticCaptureCandidate(pending.messages, messageText);
+    if (pending.timer) {
+      clearTimeout(pending.timer);
+    }
+    pending.timer = setTimeout(() => {
+      pending.timer = null;
+      void this.flushSemanticProfileCapture(sessionId).catch((error) => {
+        logUserBindEvent("semantic-profile-capture-flush-failed", {
+          userId: identity.userId,
+          sessionId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }, SEMANTIC_PROFILE_BATCH_WINDOW_MS);
+    this.pendingSemanticCaptures.set(sessionId, pending);
+  }
+
+  private async flushSemanticProfileCapture(sessionId: string): Promise<void> {
+    const pending = this.pendingSemanticCaptures.get(sessionId);
+    if (!pending) {
+      return;
+    }
+    this.pendingSemanticCaptures.delete(sessionId);
+    const identity = pending.identity;
+    const messageText = buildSemanticProfileBatchText(pending.messages);
+    if (!messageText) {
+      return;
+    }
+    if (shouldSkipSemanticProfileCapture(messageText)) {
+      logUserBindEvent("semantic-profile-capture-skipped-insufficient-signal", {
+        userId: identity.userId,
+        sessionId,
+        messagePreview: messageText.slice(0, 120),
+      });
+      return;
+    }
+    const fingerprint = hashId(`${sessionId}:${messageText}`);
     this.pruneSemanticCaptureCache();
     if (this.semanticCaptureInFlight.has(fingerprint)) {
       return;
@@ -1081,17 +1274,27 @@ class UserBindRuntime {
     if (processedAt && processedAt > Date.now() - 12 * 60 * 60 * 1000) {
       return;
     }
+    await this.runSemanticProfileCapture(identity, sessionId, messageText, fingerprint);
+  }
+
+  private async runSemanticProfileCapture(
+    identity: ResolvedIdentity,
+    sessionId: string,
+    messageText: string,
+    fingerprint: string,
+  ): Promise<void> {
     this.semanticCaptureInFlight.add(fingerprint);
     try {
       const extraction = await inferSemanticProfileExtraction(messageText, identity.profile);
       if (!extraction?.shouldUpdate) {
         logUserBindEvent("semantic-profile-capture-noop", {
           userId: identity.userId,
-          sessionId: identity.sessionId,
+          sessionId,
           confidence: extraction?.confidence ?? 0,
           messagePreview: messageText.slice(0, 120),
         });
         this.semanticCaptureCache.set(fingerprint, Date.now());
+        this.clearSemanticProfileRetryState(fingerprint);
         return;
       }
       const { patch, operations } = cleanupSemanticProfilePatch(
@@ -1101,33 +1304,279 @@ class UserBindRuntime {
       );
       if (Object.keys(patch).length === 0) {
         this.semanticCaptureCache.set(fingerprint, Date.now());
+        this.clearSemanticProfileRetryState(fingerprint);
         return;
       }
       await this.updateMyProfile(
-        { sessionId: identity.sessionId },
+        { sessionId },
         {
           ...patch,
           source: "semantic-self-update",
         },
         operations,
       );
+      await this.removePendingSemanticRefineNote(sessionId, fingerprint);
       logUserBindEvent("semantic-profile-capture-success", {
         userId: identity.userId,
-        sessionId: identity.sessionId,
+        sessionId,
         fields: Object.keys(patch),
         operations,
         confidence: extraction.confidence,
       });
       this.semanticCaptureCache.set(fingerprint, Date.now());
+      this.clearSemanticProfileRetryState(fingerprint);
     } catch (error) {
+      if (this.shouldRetrySemanticProfileCapture(error)) {
+        await this.ensurePendingSemanticRefineNote(sessionId, messageText, fingerprint);
+        this.scheduleSemanticProfileRetry(identity, sessionId, messageText, fingerprint, error);
+        return;
+      }
       logUserBindEvent("semantic-profile-capture-failed", {
         userId: identity.userId,
-        sessionId: identity.sessionId,
+        sessionId,
         message: error instanceof Error ? error.message : String(error),
       });
     } finally {
       this.semanticCaptureInFlight.delete(fingerprint);
     }
+  }
+
+  private scheduleSemanticProfileRetry(
+    identity: ResolvedIdentity,
+    sessionId: string,
+    messageText: string,
+    fingerprint: string,
+    error: unknown,
+  ): void {
+    const nextAttempt = (this.semanticCaptureRetryAttempts.get(fingerprint) ?? 0) + 1;
+    if (nextAttempt > SEMANTIC_PROFILE_RETRY_MAX_ATTEMPTS) {
+      logUserBindEvent("semantic-profile-capture-failed", {
+        userId: identity.userId,
+        sessionId,
+        attempt: nextAttempt - 1,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
+    const existing = this.semanticCaptureRetryTimers.get(fingerprint);
+    if (existing) {
+      clearTimeout(existing);
+    }
+    this.semanticCaptureRetryAttempts.set(fingerprint, nextAttempt);
+    const delayMs = computeSemanticProfileRetryDelayMs(nextAttempt);
+    const timer = setTimeout(() => {
+      this.semanticCaptureRetryTimers.delete(fingerprint);
+      void this.runSemanticProfileCapture(identity, sessionId, messageText, fingerprint);
+    }, delayMs);
+    this.semanticCaptureRetryTimers.set(fingerprint, timer);
+    logUserBindEvent("semantic-profile-capture-retry-scheduled", {
+      userId: identity.userId,
+      sessionId,
+      attempt: nextAttempt,
+      delayMs,
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  private schedulePendingSemanticSweep(delayMs = 1200): void {
+    if (this.pendingSemanticSweepTimer) {
+      clearTimeout(this.pendingSemanticSweepTimer);
+    }
+    logUserBindEvent("pending-semantic-refine-sweep-scheduled", { delayMs });
+    this.pendingSemanticSweepTimer = setTimeout(() => {
+      this.pendingSemanticSweepTimer = null;
+      void this.runPendingSemanticSweep().catch((error) => {
+        logUserBindEvent("pending-semantic-refine-sweep-failed", {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }, delayMs);
+  }
+
+  private async runPendingSemanticSweep(): Promise<void> {
+    if (this.pendingSemanticSweepInFlight) {
+      logUserBindEvent("pending-semantic-refine-sweep-skipped", { reason: "already-in-flight" });
+      return;
+    }
+    this.pendingSemanticSweepInFlight = true;
+    try {
+      const profiles = this.store.listProfilesWithPendingSemanticRefine();
+      logUserBindEvent("pending-semantic-refine-sweep-start", {
+        profileCount: profiles.length,
+        userIds: profiles.slice(0, 10).map((profile) => profile.userId),
+      });
+      for (const profile of profiles) {
+        const entries = extractPendingSemanticRefineEntries(profile.notes);
+        logUserBindEvent("pending-semantic-refine-profile-scan", {
+          userId: profile.userId,
+          entryCount: entries.length,
+        });
+        for (const entry of entries) {
+          const cachedAt = this.semanticCaptureCache.get(entry.fingerprint);
+          if (cachedAt && cachedAt > Date.now() - 12 * 60 * 60 * 1000) {
+            logUserBindEvent("pending-semantic-refine-entry-skipped", {
+              userId: profile.userId,
+              fingerprint: entry.fingerprint,
+              reason: "recently-cached",
+            });
+            continue;
+          }
+          if (this.semanticCaptureInFlight.has(entry.fingerprint)) {
+            logUserBindEvent("pending-semantic-refine-entry-skipped", {
+              userId: profile.userId,
+              fingerprint: entry.fingerprint,
+              reason: "already-in-flight",
+            });
+            continue;
+          }
+          if (this.globalPendingSemanticRefines.has(entry.fingerprint)) {
+            logUserBindEvent("pending-semantic-refine-entry-skipped", {
+              userId: profile.userId,
+              fingerprint: entry.fingerprint,
+              reason: "process-global-in-flight",
+            });
+            continue;
+          }
+          await this.runPendingSemanticProfileCapture(profile, entry.messageText, entry.fingerprint);
+        }
+      }
+    } finally {
+      this.pendingSemanticSweepInFlight = false;
+    }
+  }
+
+  private async runPendingSemanticProfileCapture(
+    profile: UserProfile,
+    messageText: string,
+    fingerprint: string,
+  ): Promise<void> {
+    if (this.globalPendingSemanticRefines.has(fingerprint)) {
+      logUserBindEvent("pending-semantic-refine-entry-skipped", {
+        userId: profile.userId,
+        fingerprint,
+        reason: "process-global-in-flight",
+      });
+      return;
+    }
+    this.globalPendingSemanticRefines.add(fingerprint);
+    this.semanticCaptureInFlight.add(fingerprint);
+    try {
+      logUserBindEvent("pending-semantic-refine-entry-start", {
+        userId: profile.userId,
+        fingerprint,
+        messagePreview: messageText.slice(0, 120),
+      });
+      const extraction = await inferSemanticProfileExtraction(messageText, profile);
+      if (!extraction?.shouldUpdate) {
+        logUserBindEvent("pending-semantic-refine-noop", {
+          userId: profile.userId,
+          fingerprint,
+        });
+        this.semanticCaptureCache.set(fingerprint, Date.now());
+        this.clearSemanticProfileRetryState(fingerprint);
+        return;
+      }
+      const { patch, operations } = cleanupSemanticProfilePatch(
+        extraction.patch,
+        profile,
+        extraction.operations,
+      );
+      const nextPatch = applyProfilePatchOperations(profile, patch, operations);
+      const cleanedNotes = removePendingSemanticRefineEntry(nextPatch.notes ?? profile.notes, fingerprint);
+      const updated = this.store.updateProfile(profile.userId, {
+        ...nextPatch,
+        notes: cleanedNotes,
+        source: "semantic-self-update",
+      });
+      const finalProfile = updated.notes?.includes(`[pending-profile-refine:${fingerprint}]`)
+        ? this.store.replaceProfileNotes(
+          profile.userId,
+          removePendingSemanticRefineEntry(updated.notes, fingerprint),
+          "semantic-self-update",
+        )
+        : updated;
+      logUserBindEvent("pending-semantic-refine-recovered", {
+        userId: profile.userId,
+        fields: Object.keys(patch),
+        confidence: extraction.confidence,
+        notesCleared: !finalProfile.notes?.includes(`[pending-profile-refine:${fingerprint}]`),
+      });
+      this.semanticCaptureCache.set(fingerprint, Date.now());
+      this.clearSemanticProfileRetryState(fingerprint);
+    } catch (error) {
+      if (this.shouldRetrySemanticProfileCapture(error)) {
+        const nextAttempt = (this.semanticCaptureRetryAttempts.get(fingerprint) ?? 0) + 1;
+        this.semanticCaptureRetryAttempts.set(fingerprint, nextAttempt);
+        if (nextAttempt <= SEMANTIC_PROFILE_RETRY_MAX_ATTEMPTS) {
+          this.schedulePendingSemanticSweep(computeSemanticProfileRetryDelayMs(nextAttempt));
+          return;
+        }
+      }
+      logUserBindEvent("pending-semantic-refine-failed", {
+        userId: profile.userId,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      this.semanticCaptureInFlight.delete(fingerprint);
+      this.globalPendingSemanticRefines.delete(fingerprint);
+    }
+  }
+
+  private clearSemanticProfileRetryState(fingerprint: string): void {
+    const timer = this.semanticCaptureRetryTimers.get(fingerprint);
+    if (timer) {
+      clearTimeout(timer);
+      this.semanticCaptureRetryTimers.delete(fingerprint);
+    }
+    this.semanticCaptureRetryAttempts.delete(fingerprint);
+  }
+
+  private shouldRetrySemanticProfileCapture(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    const normalized = message.toLowerCase();
+    return normalized.includes("timed out")
+      || normalized.includes("aborted due to timeout")
+      || normalized.includes("network connection error")
+      || normalized.includes("connection error")
+      || normalized.includes("rate limit")
+      || normalized.includes("429")
+      || normalized.includes("503")
+      || normalized.includes("busy");
+  }
+
+  private async ensurePendingSemanticRefineNote(sessionId: string, messageText: string, fingerprint: string): Promise<void> {
+    const note = buildPendingSemanticRefineNote(messageText, fingerprint);
+    const identity = await this.resolveFromContext({ sessionId });
+    if (!identity) {
+      return;
+    }
+    if (identity.profile.notes?.includes(note)) {
+      return;
+    }
+    await this.updateMyProfile(
+      { sessionId },
+      {
+        notes: note,
+        source: "semantic-refine-pending",
+      },
+      { notes: "append" },
+    );
+  }
+
+  private async removePendingSemanticRefineNote(sessionId: string, fingerprint: string): Promise<void> {
+    const identity = await this.resolveFromContext({ sessionId });
+    const currentNotes = identity?.profile.notes ?? null;
+    if (!currentNotes || !currentNotes.includes(`[pending-profile-refine:${fingerprint}]`)) {
+      return;
+    }
+    await this.updateMyProfile(
+      { sessionId },
+      {
+        notes: `[pending-profile-refine:${fingerprint}]`,
+        source: "semantic-self-update",
+      },
+      { notes: "remove" },
+    );
   }
 
   private pruneSemanticCaptureCache(): void {
@@ -1228,8 +1677,6 @@ class UserBindRuntime {
       if (!identity) {
         return;
       }
-      const captureContext = mergeSemanticCaptureContext(event, context);
-      await this.captureProfileFromMessage(captureContext, identity);
       return {
         context: [
           {
@@ -1261,7 +1708,7 @@ class UserBindRuntime {
     registerTool({
       name: "bamdra_user_bind_get_my_profile",
       description:
-        "Get the current user's bound profile before replying so nickname, timezone, and stable preferences can be used naturally in the response",
+        "Get the current user's bound profile before replying so identity facts, timezone, and stable personal preferences can be used naturally in the response",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -1275,19 +1722,31 @@ class UserBindRuntime {
     registerTool({
       name: "bamdra_user_bind_update_my_profile",
       description:
-        "Immediately write the current user's stable preferences into their profile when they clearly provide them, such as nickname, communication style, timezone, role, or durable notes",
+        "Immediately write the current user's stable profile information when they clearly provide it, such as name, nickname, gender, age, birthday, timezone, interests, communication style, role, or durable notes",
       parameters: {
         type: "object",
         additionalProperties: false,
         required: ["sessionId"],
         properties: {
           sessionId: { type: "string" },
+          name: { type: "string" },
+          nameOperation: { type: "string", enum: ["replace", "append", "remove"] },
+          gender: { type: "string" },
+          genderOperation: { type: "string", enum: ["replace", "append", "remove"] },
+          birthDate: { type: "string" },
+          birthDateOperation: { type: "string", enum: ["replace", "append", "remove"] },
+          birthYear: { type: "string" },
+          birthYearOperation: { type: "string", enum: ["replace", "append", "remove"] },
+          age: { type: "string" },
+          ageOperation: { type: "string", enum: ["replace", "append", "remove"] },
           nickname: { type: "string" },
           nicknameOperation: { type: "string", enum: ["replace", "append", "remove"] },
           preferences: { type: "string" },
           preferencesOperation: { type: "string", enum: ["replace", "append", "remove"] },
           personality: { type: "string" },
           personalityOperation: { type: "string", enum: ["replace", "append", "remove"] },
+          interests: { type: "string" },
+          interestsOperation: { type: "string", enum: ["replace", "append", "remove"] },
           role: { type: "string" },
           roleOperation: { type: "string", enum: ["replace", "append", "remove"] },
           timezone: { type: "string" },
@@ -1479,77 +1938,6 @@ class UserBindRuntime {
     return null;
   }
 
-  private async ensureFeishuScopeStatus(account?: FeishuAccountCredentials): Promise<FeishuScopeStatus> {
-    if (account) {
-      const cached = this.feishuScopeStatusCache.get(account.accountId);
-      if (cached) {
-        return cached;
-      }
-      try {
-        const token = await this.getFeishuAppAccessToken(account);
-        const result = await feishuJsonRequest(
-          account,
-          "/open-apis/application/v6/scopes",
-          token,
-        );
-        const scopes = extractScopes(result);
-        const status: FeishuScopeStatus = {
-          scopes,
-          missingIdentityScopes: REQUIRED_FEISHU_IDENTITY_SCOPES.filter((scope) => !scopes.includes(scope)),
-          hasDocumentAccess: scopes.some((scope) => scope.startsWith("bitable:") || scope.startsWith("drive:") || scope.startsWith("docx:") || scope.startsWith("docs:")),
-        };
-        this.feishuScopeStatusCache.set(account.accountId, status);
-        logUserBindEvent("feishu-scopes-read", {
-          accountId: account.accountId,
-          ...status,
-        });
-        return status;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        logUserBindEvent("feishu-scopes-attempt-failed", { accountId: account.accountId, message });
-      }
-    }
-
-    const accounts = readFeishuAccountsFromOpenClawConfig();
-    for (const candidate of accounts) {
-      const cached = this.feishuScopeStatusCache.get(candidate.accountId);
-      if (cached?.hasDocumentAccess) {
-        return cached;
-      }
-    }
-    for (const candidate of accounts) {
-      const status = await this.ensureFeishuScopeStatus(candidate);
-      if (status.hasDocumentAccess) {
-        return status;
-      }
-    }
-
-    const executor = this.host.callTool ?? this.host.invokeTool;
-    if (typeof executor === "function") {
-      try {
-        const result = await executor.call(this.host, "feishu_app_scopes", {}) as Record<string, unknown>;
-        const scopes = extractScopes(result);
-        const status = {
-          scopes,
-          missingIdentityScopes: REQUIRED_FEISHU_IDENTITY_SCOPES.filter((scope) => !scopes.includes(scope)),
-          hasDocumentAccess: scopes.some((scope) => scope.startsWith("bitable:") || scope.startsWith("drive:") || scope.startsWith("docx:") || scope.startsWith("docs:")),
-        };
-        logUserBindEvent("feishu-scopes-read", status);
-        return status;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        logUserBindEvent("feishu-scopes-failed", { message });
-        this.store.recordIssue("feishu-scope-read", message);
-      }
-    }
-
-    return {
-      scopes: [],
-      missingIdentityScopes: [...REQUIRED_FEISHU_IDENTITY_SCOPES],
-      hasDocumentAccess: false,
-    };
-  }
-
   private async getFeishuAppAccessToken(account: FeishuAccountCredentials): Promise<string> {
     const cached = this.feishuTokenCache.get(account.accountId);
     if (cached && cached.expiresAt > Date.now()) {
@@ -1582,113 +1970,18 @@ class UserBindRuntime {
     return token;
   }
 
-  private async syncFeishuMirror(identity: ResolvedIdentity): Promise<void> {
-    const scopeStatus = await this.ensureFeishuScopeStatus();
-    if (!scopeStatus.hasDocumentAccess) {
-      return;
-    }
-    const executor = this.host.callTool ?? this.host.invokeTool;
-    if (typeof executor !== "function") {
-      return;
-    }
-    try {
-      const mirror = await this.ensureFeishuBitableMirror(executor.bind(this.host));
-      if (!mirror.appToken || !mirror.tableId) {
-        return;
-      }
-      const existing = await executor.call(this.host, "feishu_bitable_list_records", {
-        app_token: mirror.appToken,
-        table_id: mirror.tableId,
-      }) as Record<string, unknown>;
-      const recordId = findBitableRecordId(existing, identity.userId);
-      const fields = {
-        user_id: identity.userId,
-        channel_type: identity.channelType,
-        open_id: identity.senderOpenId,
-        name: identity.profile.name,
-        nickname: identity.profile.nickname,
-        preferences: identity.profile.preferences,
-        personality: identity.profile.personality,
-        role: identity.profile.role,
-        timezone: identity.profile.timezone,
-        email: identity.profile.email,
-        avatar: identity.profile.avatar,
-      };
-      if (recordId) {
-        await executor.call(this.host, "feishu_bitable_update_record", {
-          app_token: mirror.appToken,
-          table_id: mirror.tableId,
-          record_id: recordId,
-          fields,
-        });
-      } else {
-        await executor.call(this.host, "feishu_bitable_create_record", {
-          app_token: mirror.appToken,
-          table_id: mirror.tableId,
-          fields,
-        });
-      }
-      logUserBindEvent("feishu-bitable-sync-success", { userId: identity.userId });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      logUserBindEvent("feishu-bitable-sync-failed", { userId: identity.userId, message });
-      this.store.recordIssue("feishu-bitable-sync", message, identity.userId);
-    }
-  }
-
-  private async ensureFeishuBitableMirror(
-    executor: <TParams>(name: string, params: TParams) => Promise<unknown>,
-  ): Promise<{ appToken: string | null; tableId: string | null }> {
-    if (this.bitableMirror?.appToken && this.bitableMirror?.tableId) {
-      return this.bitableMirror;
-    }
-    try {
-      const app = await executor("feishu_bitable_create_app", { name: "Bamdra User Bind" }) as Record<string, unknown>;
-      const appToken = extractDeepString(app, [
-        ["data", "app", "app_token"],
-        ["data", "app_token"],
-        ["app", "app_token"],
-        ["app_token"],
-      ]);
-      if (!appToken) {
-        return { appToken: null, tableId: null };
-      }
-      const meta = await executor("feishu_bitable_get_meta", { app_token: appToken }) as Record<string, unknown>;
-      const tableId = extractDeepString(meta, [
-        ["data", "tables", "0", "table_id"],
-        ["data", "items", "0", "table_id"],
-        ["tables", "0", "table_id"],
-      ]);
-      if (!tableId) {
-        this.store.recordIssue("feishu-bitable-init", "Unable to determine users table id from Feishu bitable metadata");
-        return { appToken, tableId: null };
-      }
-      for (const fieldName of ["user_id", "channel_type", "open_id", "name", "nickname", "preferences", "personality", "role", "timezone", "email", "avatar"]) {
-        try {
-          await executor("feishu_bitable_create_field", {
-            app_token: appToken,
-            table_id: tableId,
-            field_name: fieldName,
-            type: 1,
-          });
-        } catch {
-          // Field likely exists already.
-        }
-      }
-      this.bitableMirror = { appToken, tableId };
-      logUserBindEvent("feishu-bitable-ready", this.bitableMirror);
-      return this.bitableMirror;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      logUserBindEvent("feishu-bitable-init-failed", { message });
-      this.store.recordIssue("feishu-bitable-init", message);
-      return { appToken: null, tableId: null };
-    }
-  }
 }
 
 export function createUserBindPlugin(api: HookApi): UserBindRuntime {
-  return new UserBindRuntime(api, api.pluginConfig ?? api.config ?? api.plugin?.config);
+  const globalRecord = globalThis as Record<string, unknown>;
+  const existing = globalRecord[GLOBAL_RUNTIME_KEY];
+  if (isUserBindRuntimeLike(existing)) {
+    return existing;
+  }
+  const runtime = new UserBindRuntime(api, api.pluginConfig ?? api.config ?? api.plugin?.config);
+  (runtime as Record<string, unknown>)[GLOBAL_RUNTIME_BRAND_KEY] = true;
+  globalRecord[GLOBAL_RUNTIME_KEY] = runtime;
+  return runtime;
 }
 
 export function register(api: HookApi): void {
@@ -1701,12 +1994,12 @@ export async function activate(api: HookApi): Promise<void> {
 
 function normalizeConfig(input: Partial<UserBindConfig> | undefined): UserBindConfig {
   const root = join(homedir(), ".openclaw", "data", "bamdra-user-bind");
-  const storeRoot = input?.localStorePath ?? root;
+  const storeRoot = expandHomePath(input?.localStorePath) ?? root;
   return {
     enabled: input?.enabled ?? true,
     localStorePath: storeRoot,
-    exportPath: input?.exportPath ?? join(storeRoot, "exports"),
-    profileMarkdownRoot: input?.profileMarkdownRoot ?? join(storeRoot, "profiles", "private"),
+    exportPath: expandHomePath(input?.exportPath) ?? join(storeRoot, "exports"),
+    profileMarkdownRoot: expandHomePath(input?.profileMarkdownRoot) ?? join(storeRoot, "profiles", "private"),
     cacheTtlMs: input?.cacheTtlMs ?? 30 * 60 * 1000,
     adminAgents: input?.adminAgents?.length ? input.adminAgents : ["main"],
   };
@@ -1749,7 +2042,7 @@ function bootstrapOpenClawHost(config: UserBindConfig): void {
 
   const original = readFileSync(configPath, "utf8");
   const parsed = JSON.parse(original) as Record<string, unknown>;
-  const changed = ensureHostConfig(parsed, config, profileSkillTarget, adminSkillTarget);
+  const changed = ensureHostConfig(parsed, config, packageRoot, profileSkillTarget, adminSkillTarget);
   if (!changed) {
     return;
   }
@@ -1759,12 +2052,14 @@ function bootstrapOpenClawHost(config: UserBindConfig): void {
 function ensureHostConfig(
   config: Record<string, unknown>,
   pluginConfig: UserBindConfig,
+  packageRoot: string,
   profileSkillTarget: string,
   adminSkillTarget: string,
 ): boolean {
   let changed = false;
   const plugins = ensureObject(config, "plugins");
   const entries = ensureObject(plugins, "entries");
+  const installs = ensureObject(plugins, "installs");
   const load = ensureObject(plugins, "load");
   const tools = ensureObject(config, "tools");
   const skills = ensureObject(config, "skills");
@@ -1776,6 +2071,11 @@ function ensureHostConfig(
   changed = ensureArrayIncludes(plugins, "allow", PLUGIN_ID) || changed;
   changed = ensureArrayIncludes(load, "paths", join(homedir(), ".openclaw", "extensions")) || changed;
   changed = ensureArrayIncludes(skillsLoad, "extraDirs", join(homedir(), ".openclaw", "skills")) || changed;
+  changed = ensureInstallMetadata(
+    installs,
+    PLUGIN_ID,
+    readPluginInstallMetadata(PLUGIN_ID, packageRoot, join(homedir(), ".openclaw", "extensions", PLUGIN_ID)),
+  ) || changed;
 
   if (entry.enabled !== true) {
     entry.enabled = true;
@@ -1820,6 +2120,55 @@ function materializeBundledSkill(sourceDir: string, targetDir: string): void {
   }
   mkdirSync(dirname(targetDir), { recursive: true });
   cpSync(sourceDir, targetDir, { recursive: true });
+}
+
+function readPluginInstallMetadata(pluginId: string, packageRoot: string, installPath: string): PluginInstallMetadata | null {
+  try {
+    const pkg = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as {
+      name?: string;
+      version?: string;
+    };
+    const packageName = typeof pkg.name === "string" ? pkg.name : pluginId;
+    const version = typeof pkg.version === "string" ? pkg.version : "0.0.0";
+    const now = new Date().toISOString();
+    return {
+      source: "npm",
+      spec: packageName,
+      installPath,
+      version,
+      resolvedName: packageName,
+      resolvedVersion: version,
+      resolvedSpec: `${packageName}@${version}`,
+      resolvedAt: now,
+      installedAt: now,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function ensureInstallMetadata(
+  installs: Record<string, unknown>,
+  pluginId: string,
+  metadata: PluginInstallMetadata | null,
+): boolean {
+  if (!metadata) {
+    return false;
+  }
+  const current = installs[pluginId];
+  if (current && typeof current === "object" && !Array.isArray(current)) {
+    const install = current as Record<string, unknown>;
+    let changed = false;
+    for (const [key, value] of Object.entries(metadata)) {
+      if (typeof install[key] !== "string" || install[key] === "") {
+        install[key] = value;
+        changed = true;
+      }
+    }
+    return changed;
+  }
+  installs[pluginId] = metadata;
+  return true;
 }
 
 function ensureToolNames(tools: Record<string, unknown>, values: string[]): boolean {
@@ -1914,11 +2263,15 @@ function mapProfileRow(row: Record<string, unknown>): UserProfile {
     userId: String(row.user_id),
     name: asNullableString(row.name),
     gender: asNullableString(row.gender),
+    birthDate: asNullableString(row.birth_date),
+    birthYear: asNullableString(row.birth_year),
+    age: asNullableString(row.age),
     email: asNullableString(row.email),
     avatar: asNullableString(row.avatar),
     nickname: asNullableString(row.nickname),
     preferences: asNullableString(row.preferences),
     personality: asNullableString(row.personality),
+    interests: asNullableString(row.interests),
     role: asNullableString(row.role),
     timezone: asNullableString(row.timezone),
     notes: asNullableString(row.notes),
@@ -1953,16 +2306,18 @@ function parseIdentityContext(context: unknown): {
   const senderIdFromText = extractSenderIdFromMetadataText(metadataText);
   const senderNameFromText = metadataText ? extractRegexValue(metadataText, /"sender"\s*:\s*"([^"]+)"/) : null;
   const senderNameFromMessageLine = metadataText ? extractRegexValue(metadataText, /\]\s*([^\n:：]{1,40})\s*[:：]/) : null;
-  const sessionId = asNullableString(record.sessionKey)
-    ?? asNullableString(record.sessionId)
-    ?? asNullableString(session.id)
-    ?? asNullableString(conversation.id)
-    ?? asNullableString(metadata.sessionId)
-    ?? asNullableString(input.sessionId)
-    ?? asNullableString((input.session as Record<string, unknown> | undefined)?.id)
-    ?? asNullableString((record.context as Record<string, unknown> | undefined)?.sessionId)
-    ?? asNullableString(conversationInfo?.session_id)
-    ?? asNullableString(conversationInfo?.message_id);
+  const sessionId = selectPreferredSessionId([
+    asNullableString(record.sessionId),
+    asNullableString(session.id),
+    asNullableString(conversation.id),
+    asNullableString(metadata.sessionId),
+    asNullableString(input.sessionId),
+    asNullableString((input.session as Record<string, unknown> | undefined)?.id),
+    asNullableString((record.context as Record<string, unknown> | undefined)?.sessionId),
+    asNullableString(conversationInfo?.session_id),
+    asNullableString(conversationInfo?.message_id),
+    asNullableString(record.sessionKey),
+  ]);
   const channelType = asNullableString(record.channelType)
     ?? asNullableString(channel.type)
     ?? asNullableString(metadata.channelType)
@@ -2025,6 +2380,18 @@ function enrichIdentityContext(context: unknown): Record<string, unknown> {
     record.openId = sessionSnapshot.openId;
   }
   return record;
+}
+
+function selectPreferredSessionId(values: Array<string | null>): string | null {
+  const normalized = values.filter((value): value is string => typeof value === "string" && value.trim().length > 0);
+  if (normalized.length === 0) {
+    return null;
+  }
+  return normalized.find((value) => !looksLikeTransientSessionKey(value)) ?? normalized[0];
+}
+
+function looksLikeTransientSessionKey(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value);
 }
 
 function readSessionManagerSnapshot(sessionManager: Record<string, unknown>): {
@@ -2121,6 +2488,95 @@ function extractUserUtterance(context: unknown): string | null {
     return null;
   }
   return stripped;
+}
+
+function buildSemanticCaptureInput(context: unknown, utteranceText: string): string | null {
+  const record = (context && typeof context === "object") ? context as Record<string, unknown> : {};
+  const recentDialogue = readRecentProfileCaptureDialogue(record.sessionManager, utteranceText);
+  if (!recentDialogue) {
+    return utteranceText;
+  }
+  return [
+    "Recent profile-collection exchange:",
+    recentDialogue,
+  ].join("\n");
+}
+
+function shouldSkipSemanticProfileCapture(text: string): boolean {
+  const normalized = normalizeSemanticCaptureText(text);
+  if (!normalized) {
+    return true;
+  }
+  if (isTrivialSemanticCaptureUtterance(normalized)) {
+    return true;
+  }
+
+  const tokenCount = normalized.split(/\s+/).filter(Boolean).length;
+  if (normalized.length <= 4) {
+    return true;
+  }
+  return tokenCount <= 1 && !containsCjkCharacters(normalized);
+}
+
+function shouldIgnoreSemanticProfileCaptureCandidate(text: string): boolean {
+  const normalized = normalizeSemanticCaptureText(text);
+  return !normalized || isTrivialSemanticCaptureUtterance(normalized);
+}
+
+function isTrivialSemanticCaptureUtterance(normalized: string): boolean {
+  const trivialUtterances = new Set([
+    "hi",
+    "hello",
+    "hey",
+    "你好",
+    "您好",
+    "在吗",
+    "在么",
+    "在不在",
+    "有人吗",
+    "ping",
+    "test",
+    "测试",
+  ]);
+  return trivialUtterances.has(normalized);
+}
+
+function normalizeSemanticCaptureText(text: string): string {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/[!?.,，。！？、;；:："'`~()\[\]{}<>@#%^&*_+=|\\/.-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function containsCjkCharacters(text: string): boolean {
+  return /[\u3400-\u9fff\uf900-\ufaff]/.test(text);
+}
+
+function appendSemanticCaptureCandidate(existing: string[], messageText: string): string[] {
+  const normalizedCandidate = normalizeSemanticCaptureText(messageText);
+  if (!normalizedCandidate) {
+    return existing;
+  }
+  const deduped = existing.filter((item) => normalizeSemanticCaptureText(item) !== normalizedCandidate);
+  deduped.push(messageText.trim());
+  const recent = deduped.slice(-SEMANTIC_PROFILE_BATCH_MAX_FRAGMENTS);
+  while (recent.join("\n").length > SEMANTIC_PROFILE_BATCH_MAX_CHARS && recent.length > 1) {
+    recent.shift();
+  }
+  return recent;
+}
+
+function buildSemanticProfileBatchText(messages: string[]): string | null {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return null;
+  }
+  const combined = messages
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .join("\n");
+  return combined || null;
 }
 
 function extractHookContextText(record: Record<string, unknown>): string | null {
@@ -2227,6 +2683,92 @@ function normalizeHookText(value: unknown): string | null {
   return null;
 }
 
+function readRecentProfileCaptureDialogue(sessionManager: unknown, latestUserText: string): string | null {
+  if (!sessionManager || typeof sessionManager !== "object") {
+    return null;
+  }
+  try {
+    const getBranch = (sessionManager as { getBranch?: () => unknown }).getBranch;
+    const branch = typeof getBranch === "function" ? getBranch() : [];
+    if (!Array.isArray(branch) || branch.length === 0) {
+      return null;
+    }
+    const conversation: Array<{ role: string; text: string }> = [];
+    for (let i = 0; i < branch.length; i += 1) {
+      const entry = branch[i];
+      if (!entry || typeof entry !== "object") {
+        continue;
+      }
+      const item = entry as Record<string, unknown>;
+      const message = (item.message && typeof item.message === "object")
+        ? item.message as Record<string, unknown>
+        : null;
+      if (item.type !== "message" || !message) {
+        continue;
+      }
+      const role = asNullableString(message.role);
+      if (role !== "assistant" && role !== "user") {
+        continue;
+      }
+      const text = extractMessageText(message);
+      if (!text || looksLikeIdentityMetadata(text)) {
+        continue;
+      }
+      conversation.push({ role, text: text.trim() });
+    }
+    for (let i = conversation.length - 1; i >= 0; i -= 1) {
+      const entry = conversation[i];
+      if (entry.role !== "user") {
+        continue;
+      }
+      const previous = conversation[i - 1];
+      if (!previous || previous.role !== "assistant" || !looksLikeProfileCollectionPrompt(previous.text)) {
+        continue;
+      }
+      const normalizedEntry = normalizeSemanticCaptureText(entry.text);
+      const normalizedLatest = normalizeSemanticCaptureText(latestUserText);
+      if (normalizedLatest && normalizedEntry && normalizedEntry !== normalizedLatest) {
+        continue;
+      }
+      return [
+        `assistant: ${previous.text}`,
+        `user: ${latestUserText}`,
+      ].join("\n");
+    }
+  } catch (error) {
+    logUserBindEvent("session-manager-dialogue-read-failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  return null;
+}
+
+function looksLikeProfileCollectionPrompt(text: string): boolean {
+  const normalized = normalizeSemanticCaptureText(text);
+  if (!normalized) {
+    return false;
+  }
+  const keywords = [
+    "怎么称呼你",
+    "如何称呼你",
+    "怎么叫你",
+    "叫你什么",
+    "称呼",
+    "偏好的回答风格",
+    "回复风格",
+    "回答风格",
+    "沟通风格",
+    "你喜欢我怎么回复",
+    "你更喜欢",
+    "what should i call you",
+    "how should i address you",
+    "preferred style",
+    "reply style",
+    "response style",
+  ];
+  return keywords.some((keyword) => normalized.includes(normalizeSemanticCaptureText(keyword)));
+}
+
 function readLatestUserMessageFromSessionManager(sessionManager: unknown): string | null {
   if (!sessionManager || typeof sessionManager !== "object") {
     return null;
@@ -2260,25 +2802,6 @@ function readLatestUserMessageFromSessionManager(sessionManager: unknown): strin
     });
   }
   return null;
-}
-
-function mergeSemanticCaptureContext(event: unknown, context: unknown): Record<string, unknown> {
-  const merged: Record<string, unknown> = {};
-  if (event && typeof event === "object") {
-    Object.assign(merged, event as Record<string, unknown>);
-  }
-  if (context && typeof context === "object") {
-    const record = context as Record<string, unknown>;
-    for (const [key, value] of Object.entries(record)) {
-      if (merged[key] === undefined) {
-        merged[key] = value;
-      }
-    }
-  }
-  if (merged.sessionManager === undefined && context && typeof context === "object") {
-    merged.sessionManager = (context as Record<string, unknown>).sessionManager;
-  }
-  return merged;
 }
 
 function stripIdentityMetadata(text: string): string | null {
@@ -2500,9 +3023,15 @@ function getAgentIdFromContext(context: unknown): string | null {
 
 function sanitizeProfilePatch(params: Record<string, unknown>): Partial<UserProfile> {
   return {
+    name: asNullableString(params.name),
+    gender: asNullableString(params.gender),
+    birthDate: asNullableString(params.birthDate) ?? asNullableString(params.birthday),
+    birthYear: asNullableString(params.birthYear),
+    age: asNullableString(params.age),
     nickname: asNullableString(params.nickname),
     preferences: asNullableString(params.preferences),
     personality: asNullableString(params.personality),
+    interests: asNullableString(params.interests),
     role: asNullableString(params.role),
     timezone: asNullableString(params.timezone),
     notes: asNullableString(params.notes),
@@ -2511,7 +3040,7 @@ function sanitizeProfilePatch(params: Record<string, unknown>): Partial<UserProf
 
 function extractProfilePatchOperations(params: Record<string, unknown>): ProfilePatchOperations | undefined {
   const operations: ProfilePatchOperations = {};
-  const fields = ["nickname", "preferences", "personality", "role", "timezone", "notes"] as const;
+  const fields = ["name", "gender", "birthDate", "birthYear", "age", "nickname", "preferences", "personality", "interests", "role", "timezone", "notes"] as const;
   for (const field of fields) {
     const raw = asNullableString(params[`${field}Operation`]) ?? asNullableString(params[`${field}_operation`]);
     if (raw === "replace" || raw === "append" || raw === "remove") {
@@ -2558,11 +3087,32 @@ function extractUserIds(input: string): string[] {
 
 function extractProfilePatch(input: string): Partial<UserProfile> {
   const patch: Partial<UserProfile> = {};
+  const name = input.match(/(?:name|姓名)[=:： ]([^,，]+)/i);
+  const gender = input.match(/(?:gender|性别)[=:： ]([^,，]+)/i);
+  const birthDate = input.match(/(?:birthdate|birthday|生日)[=:： ]([^,，]+)/i);
+  const birthYear = input.match(/(?:birthyear|出生年份|出生年月)[=:： ]([^,，]+)/i);
+  const age = input.match(/(?:age|年龄)[=:： ]([^,，]+)/i);
   const nickname = input.match(/(?:nickname|称呼)[=:： ]([^,，]+)$/i) ?? input.match(/(?:nickname|称呼)[=:： ]([^,，]+)/i);
   const role = input.match(/(?:role|职责|角色)[=:： ]([^,，]+)/i);
   const preferences = input.match(/(?:preferences|偏好)[=:： ]([^,，]+)/i);
   const personality = input.match(/(?:personality|性格)[=:： ]([^,，]+)/i);
+  const interests = input.match(/(?:interests|兴趣|爱好)[=:： ]([^,，]+)/i);
   const timezone = input.match(/(?:timezone|时区)[=:： ]([^,，]+)/i);
+  if (name) {
+    patch.name = name[1].trim();
+  }
+  if (gender) {
+    patch.gender = gender[1].trim();
+  }
+  if (birthDate) {
+    patch.birthDate = birthDate[1].trim();
+  }
+  if (birthYear) {
+    patch.birthYear = birthYear[1].trim();
+  }
+  if (age) {
+    patch.age = age[1].trim();
+  }
   if (nickname) {
     patch.nickname = nickname[1].trim();
   }
@@ -2574,6 +3124,9 @@ function extractProfilePatch(input: string): Partial<UserProfile> {
   }
   if (personality) {
     patch.personality = personality[1].trim();
+  }
+  if (interests) {
+    patch.interests = interests[1].trim();
   }
   if (timezone) {
     patch.timezone = timezone[1].trim();
@@ -2589,6 +3142,18 @@ function renderIdentityContext(identity: ResolvedIdentity): string {
   if (identity.profile.name) {
     lines.push(`Name: ${identity.profile.name}`);
   }
+  if (identity.profile.gender) {
+    lines.push(`Gender: ${identity.profile.gender}`);
+  }
+  if (identity.profile.birthDate) {
+    lines.push(`Birth date: ${identity.profile.birthDate}`);
+  }
+  if (identity.profile.birthYear) {
+    lines.push(`Birth year: ${identity.profile.birthYear}`);
+  }
+  if (identity.profile.age) {
+    lines.push(`Age: ${identity.profile.age}`);
+  }
   if (identity.profile.nickname) {
     lines.push(`Preferred address: ${identity.profile.nickname}`);
   }
@@ -2600,6 +3165,9 @@ function renderIdentityContext(identity: ResolvedIdentity): string {
   }
   if (identity.profile.personality) {
     lines.push(`Personality: ${identity.profile.personality}`);
+  }
+  if (identity.profile.interests) {
+    lines.push(`Interests: ${identity.profile.interests}`);
   }
   if (identity.profile.role) {
     lines.push(`Role: ${identity.profile.role}`);
@@ -2619,6 +3187,18 @@ function renderProfileMarkdown(profile: UserProfile): string {
   if (profile.name) {
     frontmatterLines.push(`name: ${escapeFrontmatter(profile.name)}`);
   }
+  if (profile.gender) {
+    frontmatterLines.push(`gender: ${escapeFrontmatter(profile.gender)}`);
+  }
+  if (profile.birthDate) {
+    frontmatterLines.push(`birthDate: ${escapeFrontmatter(profile.birthDate)}`);
+  }
+  if (profile.birthYear) {
+    frontmatterLines.push(`birthYear: ${escapeFrontmatter(profile.birthYear)}`);
+  }
+  if (profile.age) {
+    frontmatterLines.push(`age: ${escapeFrontmatter(profile.age)}`);
+  }
   if (profile.nickname) {
     frontmatterLines.push(`nickname: ${escapeFrontmatter(profile.nickname)}`);
   }
@@ -2631,6 +3211,9 @@ function renderProfileMarkdown(profile: UserProfile): string {
   if (profile.personality) {
     frontmatterLines.push(`personality: ${escapeFrontmatter(profile.personality)}`);
   }
+  if (profile.interests) {
+    frontmatterLines.push(`interests: ${escapeFrontmatter(profile.interests)}`);
+  }
   if (profile.role) {
     frontmatterLines.push(`role: ${escapeFrontmatter(profile.role)}`);
   }
@@ -2640,10 +3223,15 @@ function renderProfileMarkdown(profile: UserProfile): string {
     `updatedAt: ${escapeFrontmatter(profile.updatedAt)}`,
     `syncHash: ${escapeFrontmatter(computeProfilePayloadHash({
       name: profile.name,
+      gender: profile.gender,
+      birthDate: profile.birthDate,
+      birthYear: profile.birthYear,
+      age: profile.age,
       nickname: profile.nickname,
       timezone: profile.timezone,
       preferences: profile.preferences,
       personality: profile.personality,
+      interests: profile.interests,
       role: profile.role,
       visibility: profile.visibility,
     }, notes))}`,
@@ -2672,6 +3260,18 @@ function renderConfirmedProfileSection(profile: UserProfile): string {
   if (profile.name) {
     rows.push(`- 姓名：${profile.name}`);
   }
+  if (profile.gender) {
+    rows.push(`- 性别：${profile.gender}`);
+  }
+  if (profile.birthDate) {
+    rows.push(`- 生日：${profile.birthDate}`);
+  }
+  if (profile.birthYear) {
+    rows.push(`- 出生年份：${profile.birthYear}`);
+  }
+  if (profile.age) {
+    rows.push(`- 年龄：${profile.age}`);
+  }
   if (profile.nickname) {
     rows.push(`- 称呼：${profile.nickname}`);
   }
@@ -2680,6 +3280,9 @@ function renderConfirmedProfileSection(profile: UserProfile): string {
   }
   if (profile.personality) {
     rows.push(`- 风格偏好：${profile.personality}`);
+  }
+  if (profile.interests) {
+    rows.push(`- 兴趣爱好：${profile.interests}`);
   }
   if (profile.role) {
     rows.push(`- 角色身份：${profile.role}`);
@@ -2693,15 +3296,20 @@ function renderConfirmedProfileSection(profile: UserProfile): string {
 }
 
 function computeProfilePayloadHash(
-  patch: Pick<Partial<UserProfile>, "name" | "nickname" | "timezone" | "preferences" | "personality" | "role" | "visibility">,
+  patch: Pick<Partial<UserProfile>, "name" | "gender" | "birthDate" | "birthYear" | "age" | "nickname" | "timezone" | "preferences" | "personality" | "interests" | "role" | "visibility">,
   notes: string | null,
 ): string {
   return hashId(JSON.stringify({
     name: patch.name ?? null,
+    gender: patch.gender ?? null,
+    birthDate: patch.birthDate ?? null,
+    birthYear: patch.birthYear ?? null,
+    age: patch.age ?? null,
     nickname: patch.nickname ?? null,
     timezone: patch.timezone ?? null,
     preferences: patch.preferences ?? null,
     personality: patch.personality ?? null,
+    interests: patch.interests ?? null,
     role: patch.role ?? null,
     visibility: patch.visibility ?? "private",
     notes: sanitizeProfileNotes(notes) ?? null,
@@ -2758,6 +3366,14 @@ function applyFrontmatterField(patch: Partial<UserProfile>, key: string, value: 
   const normalized = value === "null" ? null : value;
   if (key === "name") {
     patch.name = normalized;
+  } else if (key === "gender") {
+    patch.gender = normalized;
+  } else if (key === "birthDate") {
+    patch.birthDate = normalized;
+  } else if (key === "birthYear") {
+    patch.birthYear = normalized;
+  } else if (key === "age") {
+    patch.age = normalized;
   } else if (key === "nickname") {
     patch.nickname = normalized;
   } else if (key === "timezone") {
@@ -2766,6 +3382,8 @@ function applyFrontmatterField(patch: Partial<UserProfile>, key: string, value: 
     patch.preferences = normalized;
   } else if (key === "personality") {
     patch.personality = normalized;
+  } else if (key === "interests") {
+    patch.interests = normalized;
   } else if (key === "role") {
     patch.role = normalized;
   } else if (key === "visibility") {
@@ -2825,6 +3443,66 @@ function asNullableString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function expandHomePath(value: string | null | undefined): string | null {
+  const text = asNullableString(value);
+  if (!text) {
+    return null;
+  }
+  if (text === "~") {
+    return homedir();
+  }
+  if (text.startsWith("~/")) {
+    return join(homedir(), text.slice(2));
+  }
+  return text;
+}
+
+function computeSemanticProfileRetryDelayMs(attempt: number): number {
+  const base = Number(process.env.BAMDRA_USER_BIND_RETRY_BASE_MS ?? 5000);
+  const safeBase = Number.isFinite(base) && base > 0 ? base : 5000;
+  return safeBase * Math.max(1, attempt);
+}
+
+function buildPendingSemanticRefineNote(messageText: string, fingerprint: string): string {
+  const compact = messageText
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+  return `[pending-profile-refine:${fingerprint}] ${compact}`;
+}
+
+function extractPendingSemanticRefineEntries(notes: string | null | undefined): Array<{ fingerprint: string; messageText: string }> {
+  const value = sanitizeProfileNotes(notes);
+  if (!value) {
+    return [];
+  }
+  const entries: Array<{ fingerprint: string; messageText: string }> = [];
+  const pattern = /\[pending-profile-refine:([a-f0-9]+)\]\s*([^\n]+)/g;
+  for (const match of value.matchAll(pattern)) {
+    const fingerprint = match[1]?.trim();
+    const messageText = match[2]?.trim();
+    if (!fingerprint || !messageText) {
+      continue;
+    }
+    entries.push({ fingerprint, messageText });
+  }
+  return entries;
+}
+
+function removePendingSemanticRefineEntry(notes: string | null | undefined, fingerprint: string): string | null {
+  const value = sanitizeProfileNotes(notes);
+  if (!value) {
+    return null;
+  }
+  const pattern = new RegExp(`(?:^|\\n)\\[pending-profile-refine:${escapeRegExp(fingerprint)}\\][^\\n]*(?=\\n|$)`, "g");
+  const cleaned = value.replace(pattern, "").replace(/\n{3,}/g, "\n\n").trim();
+  return cleaned || null;
+}
+
 async function inferSemanticProfileExtraction(
   messageText: string,
   currentProfile: UserProfile,
@@ -2833,8 +3511,16 @@ async function inferSemanticProfileExtraction(
   if (!model) {
     return null;
   }
+  logUserBindEvent("semantic-profile-extractor-request", {
+    providerId: model.providerId,
+    modelId: model.modelId,
+    baseUrl: model.baseUrl,
+    timeoutMs: SEMANTIC_PROFILE_CAPTURE_TIMEOUT_MS,
+    messageChars: messageText.length,
+  });
   const response = await fetch(`${model.baseUrl}/chat/completions`, {
     method: "POST",
+    signal: AbortSignal.timeout(SEMANTIC_PROFILE_CAPTURE_TIMEOUT_MS),
     headers: {
       authorization: `Bearer ${model.apiKey}`,
       "content-type": "application/json; charset=utf-8",
@@ -2848,32 +3534,38 @@ async function inferSemanticProfileExtraction(
         {
           role: "system",
           content: [
-            "You extract stable user-profile information from a single user message.",
+            "You extract stable user-profile information from a single user message, a short window of recent user messages, or a brief assistant-question plus user-answer exchange from the same conversation.",
             "Return JSON only.",
-            "Only capture durable, reusable traits or preferences that should affect future conversations.",
+            "Only capture durable, reusable identity facts, preferences, and personal profile details that should affect future conversations.",
             "Ignore transient task requirements, one-off requests, or speculative guesses.",
-            "Prefer precision, but do not miss clear self-descriptions or clear addressing / style preferences.",
-            "Allowed fields: nickname, preferences, personality, role, timezone, notes.",
+            "Prefer precision, but do not miss clear self-descriptions or durable profile facts.",
+            "Allowed fields: name, gender, birthDate, birthYear, age, nickname, preferences, personality, interests, role, timezone, notes.",
             "For each field, also decide the update operation: replace, append, or remove.",
-            "notes is only for durable boundaries or habits that do not fit the structured fields.",
-            "A preferred form of address counts as nickname even when phrased naturally, for example: '以后叫我丰哥', '叫我亲爱的老大', '你就叫我阿丰'.",
-            "A reusable response preference counts as preferences, for example: '先给结论再展开', '说话直接一点但别太硬', '别太官方'.",
-            "Use append when the user adds another stable preference without revoking the old one.",
-            "Use replace when the user corrects or changes an existing stable preference.",
-            "Use remove when the user clearly asks to drop a specific old preference or trait.",
-            "If a message clearly contains both an addressing preference and a communication preference, capture both.",
-            "Do not require rigid trigger phrases. Judge by meaning.",
-            "Do not copy placeholders, examples, or template language.",
-            'Return exactly this shape: {"should_update":boolean,"confidence":number,"patch":{"nickname":string?,"preferences":string?,"personality":string?,"role":string?,"timezone":string?,"notes":string?},"operations":{"nickname":"replace|append|remove"?,"preferences":"replace|append|remove"?,"personality":"replace|append|remove"?,"role":"replace|append|remove"?,"timezone":"replace|append|remove"?,"notes":"replace|append|remove"?}}',
+            "Use the structured fields whenever possible instead of dumping transcripts into notes.",
+            "notes is only for durable boundaries or habits that do not fit the structured fields cleanly.",
+            "Use append when the user adds another stable fact or preference without revoking the old one.",
+            "Use replace when the user corrects or changes an existing stable fact or preference.",
+            "Use remove when the user clearly asks to drop a specific old fact or preference.",
+            "Do not require rigid trigger phrases. Judge by meaning, not literal wording.",
+            "If the input includes a recent assistant profile-collection question followed by a short user answer, use that dialogue context to resolve what the user meant.",
+            "Treat meta-instructions about saving or updating the profile as control signals, not profile content themselves.",
+            "Do not copy placeholders, examples, or template language into the patch.",
+            'Return exactly this shape: {"should_update":boolean,"confidence":number,"patch":{"name":string?,"gender":string?,"birthDate":string?,"birthYear":string?,"age":string?,"nickname":string?,"preferences":string?,"personality":string?,"interests":string?,"role":string?,"timezone":string?,"notes":string?},"operations":{"name":"replace|append|remove"?,"gender":"replace|append|remove"?,"birthDate":"replace|append|remove"?,"birthYear":"replace|append|remove"?,"age":"replace|append|remove"?,"nickname":"replace|append|remove"?,"preferences":"replace|append|remove"?,"personality":"replace|append|remove"?,"interests":"replace|append|remove"?,"role":"replace|append|remove"?,"timezone":"replace|append|remove"?,"notes":"replace|append|remove"?}}',
           ].join("\n"),
         },
         {
           role: "user",
           content: JSON.stringify({
             current_profile: {
+              name: currentProfile.name,
+              gender: currentProfile.gender,
+              birthDate: currentProfile.birthDate,
+              birthYear: currentProfile.birthYear,
+              age: currentProfile.age,
               nickname: currentProfile.nickname,
               preferences: currentProfile.preferences,
               personality: currentProfile.personality,
+              interests: currentProfile.interests,
               role: currentProfile.role,
               timezone: currentProfile.timezone,
               notes: currentProfile.notes,
@@ -2943,9 +3635,15 @@ function parseSemanticExtractionResult(content: string): SemanticProfileExtracti
       shouldUpdate: parsed.should_update === true || parsed.shouldUpdate === true,
       confidence: Number(parsed.confidence ?? 0),
       patch: {
+        name: asNullableString(patchInput.name),
+        gender: asNullableString(patchInput.gender),
+        birthDate: asNullableString(patchInput.birthDate),
+        birthYear: asNullableString(patchInput.birthYear),
+        age: asNullableString(patchInput.age),
         nickname: asNullableString(patchInput.nickname),
         preferences: asNullableString(patchInput.preferences),
         personality: asNullableString(patchInput.personality),
+        interests: asNullableString(patchInput.interests),
         role: asNullableString(patchInput.role),
         timezone: asNullableString(patchInput.timezone),
         notes: asNullableString(patchInput.notes),
@@ -2959,7 +3657,7 @@ function parseSemanticExtractionResult(content: string): SemanticProfileExtracti
 
 function parseProfilePatchOperations(input: Record<string, unknown>): ProfilePatchOperations | undefined {
   const operations: ProfilePatchOperations = {};
-  for (const field of ["nickname", "preferences", "personality", "role", "timezone", "notes"] as const) {
+  for (const field of ["name", "gender", "birthDate", "birthYear", "age", "nickname", "preferences", "personality", "interests", "role", "timezone", "notes"] as const) {
     const raw = asNullableString(input[field]);
     if (raw === "replace" || raw === "append" || raw === "remove") {
       operations[field] = raw;
@@ -2992,13 +3690,49 @@ function cleanupSemanticProfilePatch(
 ): { patch: Partial<UserProfile>; operations?: ProfilePatchOperations } {
   const next: Partial<UserProfile> = {};
   const nextOperations: ProfilePatchOperations = {};
+  const name = asNullableString(patch.name);
+  const gender = asNullableString(patch.gender);
+  const birthDate = asNullableString(patch.birthDate);
+  const birthYear = asNullableString(patch.birthYear);
+  const age = asNullableString(patch.age);
   const nickname = asNullableString(patch.nickname);
   const preferences = asNullableString(patch.preferences);
   const personality = asNullableString(patch.personality);
+  const interests = asNullableString(patch.interests);
   const role = asNullableString(patch.role);
   const timezone = asNullableString(patch.timezone);
   const notes = asNullableString(patch.notes);
 
+  if (name && name !== currentProfile.name) {
+    next.name = name;
+    if (operations?.name) {
+      nextOperations.name = operations.name;
+    }
+  }
+  if (gender && gender !== currentProfile.gender) {
+    next.gender = gender;
+    if (operations?.gender) {
+      nextOperations.gender = operations.gender;
+    }
+  }
+  if (birthDate && birthDate !== currentProfile.birthDate) {
+    next.birthDate = birthDate;
+    if (operations?.birthDate) {
+      nextOperations.birthDate = operations.birthDate;
+    }
+  }
+  if (birthYear && birthYear !== currentProfile.birthYear) {
+    next.birthYear = birthYear;
+    if (operations?.birthYear) {
+      nextOperations.birthYear = operations.birthYear;
+    }
+  }
+  if (age && age !== currentProfile.age) {
+    next.age = age;
+    if (operations?.age) {
+      nextOperations.age = operations.age;
+    }
+  }
   if (nickname && nickname !== currentProfile.nickname) {
     next.nickname = nickname;
     if (operations?.nickname) {
@@ -3015,6 +3749,12 @@ function cleanupSemanticProfilePatch(
     next.personality = personality;
     if (operations?.personality) {
       nextOperations.personality = operations.personality;
+    }
+  }
+  if (interests && interests !== currentProfile.interests) {
+    next.interests = interests;
+    if (operations?.interests) {
+      nextOperations.interests = operations.interests;
     }
   }
   if (role && role !== currentProfile.role) {
@@ -3047,7 +3787,7 @@ function applyProfilePatchOperations(
   operations?: ProfilePatchOperations,
 ): Partial<UserProfile> {
   const next: Partial<UserProfile> = {};
-  const fields = ["nickname", "preferences", "personality", "role", "timezone", "notes"] as const;
+  const fields = ["name", "gender", "birthDate", "birthYear", "age", "nickname", "preferences", "personality", "interests", "role", "timezone", "notes"] as const;
   for (const field of fields) {
     if (patch[field] === undefined) {
       continue;
@@ -3064,7 +3804,7 @@ function applyProfilePatchOperations(
 }
 
 function defaultProfileFieldOperation(field: keyof ProfilePatchOperations): ProfileFieldOperation {
-  if (field === "notes") {
+  if (field === "notes" || field === "interests") {
     return "append";
   }
   return "replace";
@@ -3267,35 +4007,86 @@ function readProfileExtractorModelFromOpenClawConfig(): OpenAiCompatibleModelCon
     const defaultModel = (defaults.model && typeof defaults.model === "object")
       ? defaults.model as Record<string, unknown>
       : {};
-    const configuredModel = asNullableString(defaultModel.primary) ?? asNullableString(models.primary);
-    if (!configuredModel || !configuredModel.includes("/")) {
-      return null;
+    const candidates = [
+      ...readConfiguredModelRefs(defaultModel.fallback),
+      ...readConfiguredModelRefs(defaultModel.fallbacks),
+      ...readConfiguredModelRefs(models.fallback),
+      ...readConfiguredModelRefs(models.fallbacks),
+      ...readConfiguredModelRefs(defaultModel.primary),
+      ...readConfiguredModelRefs(models.primary),
+    ];
+    for (const configuredModel of candidates) {
+      if (!configuredModel.includes("/")) {
+        continue;
+      }
+      const [providerId, modelId] = configuredModel.split("/", 2);
+      const provider = (providers[providerId] && typeof providers[providerId] === "object")
+        ? providers[providerId] as Record<string, unknown>
+        : null;
+      if (!provider) {
+        continue;
+      }
+      const api = asNullableString(provider.api);
+      const baseUrl = asNullableString(provider.baseUrl) ?? asNullableString(provider.baseURL);
+      const apiKey = asNullableString(provider.apiKey);
+      if (api !== "openai-completions" || !baseUrl || !apiKey) {
+        continue;
+      }
+      return {
+        providerId,
+        modelId,
+        baseUrl: baseUrl.replace(/\/+$/, ""),
+        apiKey,
+      };
     }
-    const [providerId, modelId] = configuredModel.split("/", 2);
-    const provider = (providers[providerId] && typeof providers[providerId] === "object")
-      ? providers[providerId] as Record<string, unknown>
-      : null;
-    if (!provider) {
-      return null;
-    }
-    const api = asNullableString(provider.api);
-    const baseUrl = asNullableString(provider.baseUrl) ?? asNullableString(provider.baseURL);
-    const apiKey = asNullableString(provider.apiKey);
-    if (api !== "openai-completions" || !baseUrl || !apiKey) {
-      return null;
-    }
-    return {
-      providerId,
-      modelId,
-      baseUrl: baseUrl.replace(/\/+$/, ""),
-      apiKey,
-    };
+    return null;
   } catch (error) {
     logUserBindEvent("profile-extractor-config-read-failed", {
       message: error instanceof Error ? error.message : String(error),
     });
     return null;
   }
+}
+
+function readSemanticProfileCaptureTimeoutMs(): number {
+  const raw = Number(process.env.BAMDRA_USER_BIND_SEMANTIC_TIMEOUT_MS ?? "12000");
+  if (!Number.isFinite(raw)) {
+    return 12000;
+  }
+  return Math.max(2500, Math.floor(raw));
+}
+
+function isUserBindRuntimeLike(value: unknown): value is UserBindRuntime {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return record[GLOBAL_RUNTIME_BRAND_KEY] === true
+    && typeof record.register === "function"
+    && typeof record.close === "function";
+}
+
+function getGlobalPendingSemanticRefines(): Set<string> {
+  const globalRecord = globalThis as Record<string, unknown>;
+  const existing = globalRecord[GLOBAL_PENDING_REFINE_KEY];
+  if (existing instanceof Set) {
+    return existing as Set<string>;
+  }
+  const created = new Set<string>();
+  globalRecord[GLOBAL_PENDING_REFINE_KEY] = created;
+  return created;
+}
+
+function readConfiguredModelRefs(value: unknown): string[] {
+  if (typeof value === "string") {
+    return value.trim() ? [value.trim()] : [];
+  }
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => asNullableString(item))
+      .filter((item): item is string => Boolean(item));
+  }
+  return [];
 }
 
 function normalizeFeishuAccount(

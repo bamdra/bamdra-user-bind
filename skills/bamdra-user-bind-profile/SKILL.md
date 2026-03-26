@@ -54,6 +54,8 @@ Use the profile tools as an action loop, not as a passive reference.
 
 When the user reveals stable profile information, do not stop at "我记住了" in prose. Actually write it back through the tool.
 
+If you just asked a profile-collection question and the user replies briefly, that short answer still counts as profile information. Examples: "叫我小李就行", "直接点", "先给结论". Do not wait for a longer sentence before calling `bamdra_user_bind_update_my_profile`.
+
 Do not surface internal profile-write failures in the user-facing reply unless the user explicitly asks about the profile system itself. Avoid lines like "系统画像更新遇到了一点技术问题". If the write path needs repair in the background, keep the reply natural and continue serving the user.
 
 ## Semantic Extraction Rule
@@ -64,9 +66,13 @@ Use model judgment to read the user's natural language and decide whether the me
 
 Think in terms of profile slots, not keywords:
 
+- the user's name or self-identification
 - how the user prefers to be addressed
+- gender when the user explicitly provides it
+- birthday, birth date, birth year, age, or other durable demographic facts when explicitly provided
 - how the user prefers answers to be structured
 - tone and communication style
+- long-lived interests, hobbies, or personal background that help future collaboration
 - role, responsibility, or identity in the collaboration
 - timezone or durable location context
 - durable dislikes, boundaries, or collaboration constraints
@@ -91,9 +97,15 @@ If a message contains both a task request and profile information, do both:
 
 Field mapping for `bamdra_user_bind_update_my_profile`:
 
+- explicit self-identification -> `name`
 - preferred form of address -> `nickname`
+- explicit gender statement -> `gender`
+- birthday or birth date -> `birthDate`
+- birth year or birth month/year -> `birthYear`
+- explicit age -> `age`
 - communication style or formatting preference -> `preferences`
 - personality or tone preference -> `personality`
+- durable interests, hobbies, or recurring passions -> `interests`
 - role or identity in collaboration -> `role`
 - timezone -> `timezone`
 - durable private notes worth remembering -> `notes`
@@ -104,16 +116,25 @@ Examples of semantic normalization:
 
 - "以后别整那么官腔" -> `personality` or `preferences`, not raw transcript dumping
 - "我比较喜欢你先说判断，再展开原因" -> `preferences`
+- "我叫李明" -> `name`
+- "我生日是 1994-08-12" -> `birthDate`
+- "我今年 31 岁" -> `age`
+- "我平时喜欢骑行和摄影" -> `interests`
 - "我是这个项目最后拍板的人" -> `role`
 - "别老叫我老师，直接叫我名字就行" -> `nickname` or `notes`, depending on what is clearest
 - "我不喜欢太长铺垫" -> `preferences` or `notes`
 
 Examples:
 
-- "以后叫我阿丰" -> call `bamdra_user_bind_update_my_profile` with `nickname: "阿丰"`
+- "我叫李明" -> call `bamdra_user_bind_update_my_profile` with `name: "李明"`
+- "以后叫我小李" -> call `bamdra_user_bind_update_my_profile` with `nickname: "小李"`
+- "我是女性" -> call `bamdra_user_bind_update_my_profile` with `gender: "女性"`
+- "我生日是 1994-08-12" -> call `bamdra_user_bind_update_my_profile` with `birthDate: "1994-08-12"`
+- "我今年 31 岁" -> call `bamdra_user_bind_update_my_profile` with `age: "31"`
 - "你先给结论，再展开" -> call `bamdra_user_bind_update_my_profile` with `preferences: "偏好先给结论，再展开"`
 - "说话直接一点，但别太冲" -> call `bamdra_user_bind_update_my_profile` with `personality: "偏好直接、克制、不生硬"`
-- "我常驻 Berlin" -> call `bamdra_user_bind_update_my_profile` with `timezone: "Europe/Berlin"`
+- "我喜欢骑行和摄影" -> call `bamdra_user_bind_update_my_profile` with `interests: "骑行；摄影"`
+- "我常驻东京" -> call `bamdra_user_bind_update_my_profile` with `timezone: "Asia/Tokyo"`
 - "我是这个项目的负责人" -> call `bamdra_user_bind_update_my_profile` with `role: "项目负责人"`
 
 If one user message contains both service intent and stable profile facts, do both in the same turn:
@@ -135,11 +156,11 @@ When the user clearly provides a stable preference or asks to remember how to wo
 
 Good examples:
 
-- “以后叫我老板”
-- “我在 Europe/Berlin 时区”
+- “以后叫我小李”
+- “我在 Asia/Tokyo 时区”
 - “我偏好幽默一点，但别太浮夸”
 - “我更喜欢先给结论，再展开”
-- “应该叫我阿丰，不用太正式”
+- “应该叫我名字，不用太正式”
 - “第一次配合的话，你可以先简短一点”
 - “别太像客服，直接一点”
 - “我是这个项目的负责人”
@@ -158,9 +179,13 @@ Treat profile-style facts as private-by-default.
 
 These should stay in the current user's profile or user-scoped memory, not `shared` memory:
 
+- 姓名
+- 性别
+- 生日 / 出生年月 / 年龄
 - 称呼方式
 - 时区
 - 对话风格偏好
+- 兴趣爱好
 - 角色和职责
 - 宠物、家庭、个人背景
 - 当前主要工作和长期个人目标

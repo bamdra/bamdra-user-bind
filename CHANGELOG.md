@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.1.14 - 2026-03-24
+
+### Added
+
+- broader profile schema coverage for living user traits, including fields such as `birthDate`, `birthYear`, `age`, and `interests`
+- pending-refine recovery so interrupted profile extraction work can be retried after startup instead of leaving stale pending markers behind
+
+### Changed
+
+- updated the profile skill guidance so profile extraction is driven by the skill and the structured schema rather than brittle hard-coded wording
+- profile refinement now prefers configured fallback models when present and only falls back to the primary model when no separate extractor path exists
+
+### Fixed
+
+- expanded npm and runtime bootstrap so OpenClaw `v2026.3.23` writes correct `plugins.installs` metadata and resolves `~/.openclaw/...` paths against the active user home
+- reduced the chance that profile extraction silently disappears after install because the plugin directory, skills, or standalone install metadata were only partially materialized
+
 ## v0.1.13 - 2026-03-23
 
 ### Added

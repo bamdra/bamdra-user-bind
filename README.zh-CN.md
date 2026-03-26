@@ -6,6 +6,8 @@ Bamdra 套件中的身份与“活画像”层。
 
 它可以独立运行，也会被 `bamdra-openclaw-memory` 自动补齐。
 
+已验证适配 OpenClaw `v2026.3.23`。
+
 单独安装：
 
 ```bash
@@ -37,6 +39,7 @@ openclaw plugins install @bamdra/bamdra-user-bind
 - 当稳定绑定暂时拿不到时，运行时可以先落一份 provisional 画像，后续补到真实绑定后再自动归并
 - 画像更新现在支持语义上的 `replace / append / remove`，不再只有整段覆盖
 - Markdown 镜像继续保留 frontmatter 作为机器主源，并把正文里的“已确认画像”变成同步的人类可读镜像
+- 在 OpenClaw `v2026.3.23` 下通过 npm 安装时，现在会自动补齐 `plugins.installs` 元数据，并把 `~/.openclaw/...` 正确解析到当前用户目录
 
 ## 画像策略
 

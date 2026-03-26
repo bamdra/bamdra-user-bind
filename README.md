@@ -6,6 +6,8 @@ The identity and living profile layer for the Bamdra suite.
 
 It can run independently, and it is also auto-provisioned by `bamdra-openclaw-memory`.
 
+Tested with OpenClaw `v2026.3.23`.
+
 Install directly:
 
 ```bash
@@ -37,6 +39,7 @@ Recent behavior improvements:
 - when a stable binding is temporarily unavailable, the runtime can persist a provisional profile first and merge it into the stable profile later
 - profile updates now support semantic `replace`, `append`, and `remove` instead of only blind overwrite
 - the Markdown mirror now keeps frontmatter as the machine-readable source and renders a synchronized `Confirmed Profile` section for humans
+- npm installs on OpenClaw `v2026.3.23` now auto-register the plugin's `plugins.installs` metadata and resolve `~/.openclaw/...` paths against the current user home
 
 ## Profile Policy
 
