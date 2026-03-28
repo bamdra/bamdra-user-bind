@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.16 - 2026-03-29
+
+### Fixed
+
+- copied bundled profile and admin skills into `dist/skills/` during release preparation so npm installs and manual release bundles keep the same skill payload
+- added release-packaging regression coverage for skill materialization so future packaging updates do not silently drop the bundled SKILL files
+
 ## v0.1.15 - 2026-03-27
 
 ### Added

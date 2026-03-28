@@ -1,8 +1,10 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const distDir = resolve(repoRoot, "dist");
+const skillsDir = resolve(repoRoot, "skills");
+const distSkillsDir = resolve(distDir, "skills");
 
 mkdirSync(distDir, { recursive: true });
 
@@ -28,3 +30,7 @@ const distManifest = {
 
 writeFileSync(resolve(distDir, "package.json"), `${JSON.stringify(distPackage, null, 2)}\n`);
 writeFileSync(resolve(distDir, "openclaw.plugin.json"), `${JSON.stringify(distManifest, null, 2)}\n`);
+
+if (existsSync(skillsDir)) {
+  cpSync(skillsDir, distSkillsDir, { recursive: true });
+}
