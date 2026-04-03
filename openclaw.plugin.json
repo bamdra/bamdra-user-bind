@@ -3,7 +3,7 @@
   "type": "tool",
   "name": "Bamdra User Bind",
   "description": "Identity resolution, user profile binding, and admin profile tools for OpenClaw channels.",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "main": "./dist/index.js",
   "skills": ["./skills"],
   "configSchema": {

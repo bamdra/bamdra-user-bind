@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.17 - 2026-04-03
+
+### Fixed
+
+- reset the singleton runtime when a new host API instance registers the plugin, so repeated test or bootstrap setups do not silently reuse stale hook registrars
+- let `before_prompt_build` merge event and context payloads, flush semantic profile capture immediately, and return the refreshed identity context in the same hook turn
+
+### Notes
+
+- this patch is intended to pair with `@bamdra/bamdra-openclaw-memory@0.3.25`
+
 ## v0.1.16 - 2026-03-29
 
 ### Fixed
