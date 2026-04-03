@@ -864,6 +864,10 @@ class UserBindRuntime {
     this.store.close();
   }
 
+  usesHost(api: HookApi): boolean {
+    return this.host === api;
+  }
+
   register(): void {
     if (this.registered) {
       return;
@@ -1673,15 +1677,19 @@ class UserBindRuntime {
       },
     );
     this.host.on?.("before_prompt_build", async (event, context) => {
-      const identity = await this.resolveFromContext(context);
+      const mergedContext = mergeHookContexts(context, event);
+      const identity = await this.resolveFromContext(mergedContext);
       if (!identity) {
         return;
       }
+      await this.captureProfileFromMessage(mergedContext, identity);
+      await this.flushSemanticProfileCapture(identity.sessionId);
+      const latestIdentity = await this.resolveFromContext(mergedContext) ?? identity;
       return {
         context: [
           {
             type: "text",
-            text: renderIdentityContext(identity),
+            text: renderIdentityContext(latestIdentity),
           },
         ],
       };
@@ -1976,7 +1984,10 @@ export function createUserBindPlugin(api: HookApi): UserBindRuntime {
   const globalRecord = globalThis as Record<string, unknown>;
   const existing = globalRecord[GLOBAL_RUNTIME_KEY];
   if (isUserBindRuntimeLike(existing)) {
-    return existing;
+    if (existing.usesHost(api)) {
+      return existing;
+    }
+    existing.close();
   }
   const runtime = new UserBindRuntime(api, api.pluginConfig ?? api.config ?? api.plugin?.config);
   (runtime as Record<string, unknown>)[GLOBAL_RUNTIME_BRAND_KEY] = true;
@@ -2488,6 +2499,18 @@ function extractUserUtterance(context: unknown): string | null {
     return null;
   }
   return stripped;
+}
+
+function mergeHookContexts(...contexts: unknown[]): Record<string, unknown> {
+  return contexts.reduce<Record<string, unknown>>((merged, context) => {
+    if (!context || typeof context !== "object") {
+      return merged;
+    }
+    return {
+      ...merged,
+      ...(context as Record<string, unknown>),
+    };
+  }, {});
 }
 
 function buildSemanticCaptureInput(context: unknown, utteranceText: string): string | null {
